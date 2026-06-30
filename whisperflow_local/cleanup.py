@@ -55,6 +55,10 @@ class Cleaner:
         if not out:
             return transcript
 
+        # collapse newlines/whitespace to a single line — a stray newline pasted
+        # into a chat box submits early and splits the message into two.
+        out = " ".join(out.split())
+
         # anti-injection / runaway guard
         if len(out) > len(transcript) * self._max_ratio:
             return transcript

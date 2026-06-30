@@ -13,6 +13,7 @@ stt:
   model: "large-v3-turbo"        # faster-whisper model id (speed-first)
   device: "cuda"                 # falls back to cpu if cuda check fails
   compute_type: "float16"        # int8_float16 on tight VRAM
+  beam_size: 1                   # greedy = much faster for short dictation
   # confidence gates — drop empty/hallucinated output (no paste)
   min_duration_s: 0.4
   min_rms: 0.005
@@ -44,6 +45,12 @@ insert:
 
 overlay:
   enabled: true
+
+sound:
+  enabled: true                  # audible cue when recording starts/stops
+  start_freq: 920                # Hz
+  stop_freq: 560                 # Hz
+  duration_ms: 80
 
 logging:
   metadata_only: true            # never log transcript text unless false

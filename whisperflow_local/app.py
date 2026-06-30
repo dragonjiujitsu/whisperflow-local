@@ -51,6 +51,7 @@ class Controller(QObject):
         self.pill = VoicePill()
         self._sr = int(cfg.audio["sample_rate"])
         self._enter_listener: keyboard.Listener | None = None
+        self._sound = cfg.sound
 
         # overlay level pump (main-thread timer)
         self._pump = QTimer(self)
@@ -75,6 +76,7 @@ class Controller(QObject):
 
     def _start_recording(self) -> None:
         self.state = RECORDING
+        self._beep(self._sound.get("start_freq", 920))
         self.recorder.start()
         self.show_overlay.emit()
         self._pump.start()
@@ -83,6 +85,7 @@ class Controller(QObject):
 
     def _stop_and_process(self) -> None:
         self.state = PROCESSING
+        self._beep(self._sound.get("stop_freq", 560))
         self._stop_enter_stop()
         self._pump.stop()
         self.hide_overlay.emit()
@@ -149,6 +152,21 @@ class Controller(QObject):
 
     def _hide(self) -> None:
         self.pill.hide_pill()
+
+    def _beep(self, freq: int) -> None:
+        if not self._sound.get("enabled", False):
+            return
+        dur = int(self._sound.get("duration_ms", 80))
+
+        def play():
+            try:
+                import winsound
+
+                winsound.Beep(int(freq), dur)
+            except Exception:
+                pass
+
+        threading.Thread(target=play, daemon=True).start()
 
     def warmup(self) -> None:
         self.stt.load()

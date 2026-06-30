@@ -40,6 +40,10 @@ class Config:
         return self.raw["overlay"]
 
     @property
+    def sound(self) -> dict[str, Any]:
+        return self.raw.get("sound", {"enabled": False})
+
+    @property
     def logging(self) -> dict[str, Any]:
         return self.raw["logging"]
 

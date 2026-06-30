@@ -83,7 +83,7 @@ class Transcriber:
             audio,
             language="en",
             vad_filter=True,
-            beam_size=5,
+            beam_size=int(self._cfg.get("beam_size", 1)),
         )
 
         parts: list[str] = []
