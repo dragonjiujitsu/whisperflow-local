@@ -80,6 +80,30 @@ All knobs live in `config.yaml` — hotkey, STT model/thresholds, cleanup model 
 prompt, insertion mode, max recording length, sounds, logging. Logging is
 **metadata-only by default**; transcript text is logged only if you opt in.
 
+## macOS / Linux
+
+**This is a Windows v1 — it won't run as-is on a Mac.** The core (audio capture,
+the local Ollama cleanup, the state machine, the Qt pill) is cross-platform, but
+several pieces are Windows-specific and need a Mac equivalent:
+
+- **STT engine** — there's no CUDA on Mac. Swap `faster-whisper`/CUDA for
+  **`mlx-whisper`** or **`whisper.cpp`** (Apple-Silicon/Metal). *(biggest change)*
+- **Overlay** (`overlay.py`) — the non-activating, click-through window uses Win32
+  styles; on macOS that's a Cocoa `NSPanel` (non-activating + `ignoresMouseEvents`).
+- **Focus-safe insert** (`inserter.py`) — uses Win32 focus APIs + `Ctrl+V`; macOS
+  needs the **Accessibility API** for focus and **`Cmd+V`** to paste.
+- **Hotkey** — there's no `Win` key; pick something like `Cmd+Opt`, and macOS will
+  require granting **Accessibility permission**.
+- **Autostart** (`autostart.py`) — a Startup `.lnk` becomes a **LaunchAgent**
+  plist in `~/Library/LaunchAgents`.
+
+Two good paths: **(a)** point Claude Code at this repo and ask it to *port to
+macOS* — the clean way is a small platform layer (`_win`/`_mac` implementations
+of inserter/overlay/hotkey/autostart/stt) so `app.py` never changes; or **(b)**
+re-run the build pipeline targeting macOS from scratch. Note that Mac already has
+strong **local** dictation tools (superwhisper, MacWhisper), so the "WhisperFlow
+is cloud-only" motivation is Windows-specific.
+
 ## Status
 
 v1, Windows-only. **In:** toggle dictation, local cleanup, focus-safe paste,
