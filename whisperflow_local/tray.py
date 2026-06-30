@@ -7,15 +7,23 @@ a dropped reference gets garbage-collected and the icon vanishes.
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Callable
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon
 
+_ICON_FILE = Path(__file__).resolve().parents[1] / "assets" / "icon.ico"
+
 
 def _make_icon() -> QIcon:
-    """A small mic-dot glyph, drawn at runtime so we ship no .ico file."""
+    """The sand-pill icon (assets/icon.ico, rendered by tools/make_icon.py).
+    Falls back to a painted mic-dot glyph if the asset is missing."""
+    if _ICON_FILE.exists():
+        icon = QIcon(str(_ICON_FILE))
+        if not icon.isNull():
+            return icon
     pix = QPixmap(64, 64)
     pix.fill(Qt.transparent)
     p = QPainter(pix)

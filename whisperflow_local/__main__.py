@@ -272,10 +272,14 @@ def run() -> int:
     from .app import Controller
     from .hotkey import HotkeyListener
 
-    from .tray import make_tray
+    from PySide6.QtGui import QIcon
+
+    from .tray import _ICON_FILE, make_tray
 
     cfg = load_config()
     qapp = QApplication.instance() or QApplication(sys.argv)
+    if _ICON_FILE.exists():
+        qapp.setWindowIcon(QIcon(str(_ICON_FILE)))
     # the pill hides between dictations; don't let that quit the app
     qapp.setQuitOnLastWindowClosed(False)
     ctrl = Controller(cfg)
