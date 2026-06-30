@@ -13,7 +13,7 @@ argument that hardened it).
 
 ## Pipeline
 
-`Ctrl+Alt+Space` (toggle) → mic capture (`sounddevice`) → STT
+`Win+F` (toggle) → mic capture (`sounddevice`) → STT
 (`faster-whisper large-v3-turbo`, CUDA) → cleanup (Ollama, local) → focus-safe
 clipboard paste into the active field. A non-activating, click-through PySide6
 pill shows live mic level without stealing focus.
@@ -30,7 +30,7 @@ python -m whisperflow_local doctor    # validate mic / CUDA / Ollama / clipboard
 ## Use
 
 ```bash
-python -m whisperflow_local run        # live: toggle with Ctrl+Alt+Space
+python -m whisperflow_local run        # live: toggle with Win+F (frees it via DisabledHotkeys on first run)
 python -m whisperflow_local selftest   # autonomous end-to-end on a spoken sample
 python -m whisperflow_local doctor     # environment health check
 ```

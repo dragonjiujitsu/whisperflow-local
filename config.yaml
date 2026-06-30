@@ -1,7 +1,9 @@
 # whisperflow-local configuration. All runtime knobs live here.
 
 hotkey:
-  combo: "<scroll_lock>"          # dedicated dead key — near-zero collision, no AltGr
+  combo: "<cmd>+f"                # Win+F. Reserved by Feedback Hub — freed at the
+                                  # Explorer level via DisabledHotkeys (see winhotkey.py).
+                                  # Auto-applied on `run`; reported by `doctor`.
 
 audio:
   sample_rate: 16000              # faster-whisper expects 16kHz mono
