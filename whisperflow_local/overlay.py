@@ -9,20 +9,19 @@ Qt window flags/attributes get the cross-platform 80%; the Win32 extended styles
 (WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_TOOLWINDOW) stamped
 on the HWND give the hard guarantees.
 
-Visuals: a segmented LED equalizer — tall RGB bars that track live mic RMS — over
-a glassy translucent body, with a flowing hue-shift and a subtle animated rainbow
-border (rotating conical gradient). Eased attack/decay + idle shimmer.
+Visuals: a premium flowing waveform — layered sine ribbons that undulate with live
+mic RMS over a glassy translucent body, in a restrained cool gradient (no RGB
+cycling). Gentle idle motion, eased attack/decay, soft glow, hairline border.
 """
 from __future__ import annotations
 
 import math
 import sys
 
-from PySide6.QtCore import QRectF, Qt, QTimer, Slot
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Slot
 from PySide6.QtGui import (
     QBrush,
     QColor,
-    QConicalGradient,
     QLinearGradient,
     QPainter,
     QPainterPath,
@@ -37,6 +36,11 @@ WS_EX_TRANSPARENT = 0x00000020
 WS_EX_LAYERED = 0x00080000
 WS_EX_TOOLWINDOW = 0x00000080
 
+# restrained, premium cool palette (no hue cycling)
+C_BLUE = QColor(0x6E, 0xA8, 0xFE)    # soft blue
+C_LILAC = QColor(0xB7, 0x9C, 0xF5)   # lavender
+C_TEAL = QColor(0x6F, 0xE7, 0xD2)    # soft teal
+
 
 def _apply_passthrough_styles(hwnd: int) -> None:
     import win32gui
@@ -47,12 +51,15 @@ def _apply_passthrough_styles(hwnd: int) -> None:
 
 
 class VoicePill(QWidget):
-    """Segmented RGB LED equalizer pill. ``set_level(rms)`` (0..1) drives it;
-    never steals focus."""
+    """Premium flowing-waveform pill. ``set_level(rms)`` (0..1) drives the
+    amplitude; never steals focus."""
 
-    N_BARS = 21
-    SEG_H = 7.0     # LED segment height
-    SEG_GAP = 3.0   # gap between segments
+    # three layered ribbons: (freq, speed, amp-scale, alpha)
+    LAYERS = (
+        (1.4, 1.7, 1.00, 230),
+        (2.3, -1.1, 0.62, 150),
+        (3.1, 0.8, 0.40, 90),
+    )
 
     def __init__(self) -> None:
         super().__init__()
@@ -61,13 +68,11 @@ class VoicePill(QWidget):
         )
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
-        self.resize(380, 132)
+        self.resize(360, 104)
 
         self._level = 0.0
         self._smooth = 0.0
         self._t = 0.0
-        self._hue = 0.0
-        self._bars = [0.0] * self.N_BARS
 
         self._tick = QTimer(self)
         self._tick.timeout.connect(self._animate)
@@ -98,26 +103,30 @@ class VoicePill(QWidget):
 
     def _animate(self) -> None:
         self._t += 0.016
-        self._hue = (self._hue + 1.4) % 360
-
         if self._level > self._smooth:
-            self._smooth += (self._level - self._smooth) * 0.5
+            self._smooth += (self._level - self._smooth) * 0.45
         else:
-            self._smooth += (self._level - self._smooth) * 0.12
-
-        n = self.N_BARS
-        for i in range(n):
-            pos = i / (n - 1)
-            dome = math.sin(math.pi * pos) ** 0.7
-            ripple = (
-                0.6 * math.sin(self._t * 9 - i * 0.6)
-                + 0.4 * math.sin(self._t * 5 + i * 0.35)
-            )
-            ripple = (ripple + 1) / 2
-            idle = 0.12 + 0.07 * math.sin(self._t * 3 + i * 0.5)
-            target = idle + dome * (0.30 + 0.70 * ripple) * self._smooth
-            self._bars[i] += (max(0.06, min(1.0, target)) - self._bars[i]) * 0.45
+            self._smooth += (self._level - self._smooth) * 0.10
         self.update()
+
+    def _wave_path(self, rect: QRectF, freq: float, speed: float,
+                   amp: float, phase: float) -> QPainterPath:
+        cy = rect.center().y()
+        left = rect.left() + 18
+        right = rect.right() - 18
+        width = right - left
+        path = QPainterPath()
+        steps = 64
+        for k in range(steps + 1):
+            fx = k / steps
+            x = left + fx * width
+            env = math.sin(math.pi * fx)  # taper to 0 at both ends
+            y = cy + env * amp * math.sin(2 * math.pi * freq * fx + phase)
+            if k == 0:
+                path.moveTo(QPointF(x, y))
+            else:
+                path.lineTo(QPointF(x, y))
+        return path
 
     def paintEvent(self, _event) -> None:  # noqa: N802
         p = QPainter(self)
@@ -125,69 +134,52 @@ class VoicePill(QWidget):
         w, h = self.width(), self.height()
         margin = 8.0
         rect = QRectF(margin, margin, w - 2 * margin, h - 2 * margin)
-        radius = 26.0
+        radius = rect.height() / 2
 
-        # glassy translucent body (NOT pitch black): dark plum -> charcoal
+        # glassy translucent body — deep slate, subtly see-through
         body = QPainterPath()
         body.addRoundedRect(rect, radius, radius)
         bg = QLinearGradient(0, rect.top(), 0, rect.bottom())
-        bg.setColorAt(0.0, QColor(34, 26, 44, 208))
-        bg.setColorAt(0.55, QColor(20, 18, 28, 210))
-        bg.setColorAt(1.0, QColor(12, 12, 18, 214))
+        bg.setColorAt(0.0, QColor(26, 28, 38, 205))
+        bg.setColorAt(1.0, QColor(15, 16, 22, 212))
         p.fillPath(body, bg)
 
         p.setClipPath(body)
-        # hue-tinted bottom glow so the body feels alive, not flat black
-        glow_col = QColor.fromHsvF(self._hue / 360.0, 0.6, 1.0, 0.10)
-        gglow = QLinearGradient(0, rect.bottom(), 0, rect.center().y())
-        gglow.setColorAt(0.0, glow_col)
-        gglow.setColorAt(1.0, QColor(0, 0, 0, 0))
-        p.fillRect(rect, gglow)
 
-        # --- segmented LED bars ---------------------------------------------
-        n = self.N_BARS
-        usable = rect.width() - 30
-        cw = usable / n
-        bar_w = min(cw * 0.6, 12.0)
-        x0 = rect.left() + 15
-        baseline = rect.bottom() - 13
-        top_limit = rect.top() + 14
-        max_h = baseline - top_limit
-        unit = self.SEG_H + self.SEG_GAP
-        total_segs = max(3, int(max_h / unit))
+        # amplitude: gentle idle breathing + voice
+        max_amp = (rect.height() / 2) - 10
+        amp = max_amp * (0.16 + 0.84 * self._smooth)
 
-        for i in range(n):
-            lit = max(1, int(round(self._bars[i] * total_segs)))
-            cx = x0 + i * cw + (cw - bar_w) / 2
-            for s in range(lit):
-                y = baseline - (s + 1) * unit + self.SEG_GAP
-                # hue flows across columns AND up each bar; top segments hotter
-                hue = (self._hue + i * 10 + s * 4) % 360
-                val = 0.75 + 0.25 * (s / total_segs)
-                seg = QRectF(cx, y, bar_w, self.SEG_H)
-                # glow underlay
-                p.fillRect(
-                    QRectF(cx - 1.5, y - 1.5, bar_w + 3, self.SEG_H + 3),
-                    QColor.fromHsvF(hue / 360.0, 0.85, 1.0, 0.22),
-                )
-                path = QPainterPath()
-                path.addRoundedRect(seg, 2.5, 2.5)
-                p.fillPath(path, QColor.fromHsvF(hue / 360.0, 0.78, val, 0.97))
+        # shared horizontal gradient for the ribbons (cool, no cycling)
+        grad = QLinearGradient(rect.left(), 0, rect.right(), 0)
+        grad.setColorAt(0.0, C_BLUE)
+        grad.setColorAt(0.5, C_LILAC)
+        grad.setColorAt(1.0, C_TEAL)
+
+        for freq, speed, ascale, alpha in self.LAYERS:
+            path = self._wave_path(rect, freq, speed, amp * ascale, self._t * speed)
+            # soft glow pass
+            glow = QColor(C_LILAC)
+            glow.setAlpha(int(alpha * 0.28))
+            p.setPen(QPen(glow, 6.0))
+            p.drawPath(path)
+            # crisp gradient stroke
+            pen = QPen(QBrush(grad), 2.4)
+            pen.setCapStyle(Qt.RoundCap)
+            # apply layer alpha by drawing into a clipped translucent pass
+            p.setOpacity(alpha / 255.0)
+            p.setPen(pen)
+            p.drawPath(path)
+            p.setOpacity(1.0)
+
         p.setClipping(False)
 
-        # --- subtle animated rainbow border ---------------------------------
-        cg = QConicalGradient(w / 2, h / 2, -self._t * 55 % 360)
-        for k in range(7):
-            hue = (self._hue + k * 60) % 360
-            cg.setColorAt(k / 6.0, QColor.fromHsvF(hue / 360.0, 0.85, 1.0, 0.7))
-        pen = QPen(QBrush(cg), 1.8)
-        p.setPen(pen)
+        # hairline border + glassy top highlight (subtle, static)
+        p.setPen(QPen(QColor(255, 255, 255, 36), 1.0))
         p.setBrush(Qt.NoBrush)
         p.drawRoundedRect(rect, radius, radius)
-
-        # glassy top highlight
         p.setClipPath(body)
-        p.fillRect(QRectF(rect.left(), rect.top(), rect.width(), 2),
-                   QColor(255, 255, 255, 22))
+        p.fillRect(QRectF(rect.left(), rect.top(), rect.width(), 1.5),
+                   QColor(255, 255, 255, 26))
         p.setClipping(False)
         p.end()

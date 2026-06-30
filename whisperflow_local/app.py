@@ -96,18 +96,36 @@ class Controller(QObject):
         threading.Thread(target=self._process, args=(audio, target), daemon=True).start()
 
     def _process(self, audio, target) -> None:
+        t0 = time.perf_counter()
         try:
             transcript = _with_timeout(
                 lambda: self.stt.transcribe(audio, self._sr), STT_TIMEOUT_S, ""
             )
+            t_stt = time.perf_counter()
             if not transcript:
                 self.log.info("stt=empty -> no insert")
+                print(f"[timing] stt={ (t_stt-t0)*1000:.0f}ms -> empty, no insert",
+                      flush=True)
                 return
             cleaned = _with_timeout(
                 lambda: self.cleaner.clean(transcript), CLEANUP_TIMEOUT_S, transcript
             )
+            t_clean = time.perf_counter()
             ok, reason = self.inserter.insert(cleaned, target)
-            self.log.info("insert ok=%s reason=%s chars=%d", ok, reason, len(cleaned))
+            t_ins = time.perf_counter()
+            audio_s = audio.size / self._sr
+            print(
+                f"[timing] audio={audio_s:.1f}s | stt={(t_stt-t0)*1000:.0f}ms "
+                f"| cleanup={(t_clean-t_stt)*1000:.0f}ms "
+                f"| insert={(t_ins-t_clean)*1000:.0f}ms "
+                f"| total={(t_ins-t0)*1000:.0f}ms | ok={ok}",
+                flush=True,
+            )
+            self.log.info(
+                "timing audio_s=%.1f stt_ms=%.0f cleanup_ms=%.0f insert_ms=%.0f total_ms=%.0f ok=%s",
+                audio_s, (t_stt-t0)*1000, (t_clean-t_stt)*1000,
+                (t_ins-t_clean)*1000, (t_ins-t0)*1000, ok,
+            )
         except Exception as exc:  # guarantee return to IDLE
             self.log.exception("process error: %s", type(exc).__name__)
         finally:
@@ -156,17 +174,13 @@ class Controller(QObject):
     def _beep(self, freq: int) -> None:
         if not self._sound.get("enabled", False):
             return
-        dur = int(self._sound.get("duration_ms", 80))
+        from . import sound
 
-        def play():
-            try:
-                import winsound
-
-                winsound.Beep(int(freq), dur)
-            except Exception:
-                pass
-
-        threading.Thread(target=play, daemon=True).start()
+        sound.play_tone(
+            float(freq),
+            int(self._sound.get("duration_ms", 110)),
+            float(self._sound.get("volume", 0.06)),
+        )
 
     def warmup(self) -> None:
         self.stt.load()

@@ -47,10 +47,11 @@ overlay:
   enabled: true
 
 sound:
-  enabled: true                  # audible cue when recording starts/stops
-  start_freq: 920                # Hz
-  stop_freq: 560                 # Hz
-  duration_ms: 80
+  enabled: true                  # soft sine cue when recording starts/stops
+  start_freq: 587                # Hz (D5 — gentle)
+  stop_freq: 440                 # Hz (A4 — lower, softer)
+  duration_ms: 120
+  volume: 0.05                   # quiet; raise toward 0.15 if too soft
 
 logging:
   metadata_only: true            # never log transcript text unless false
