@@ -57,16 +57,21 @@ class Transcriber:
     def __init__(self, cfg: dict) -> None:
         self._cfg = cfg
         self._model = None  # lazy: importing faster_whisper loads CUDA libs
+        self._pipe = None   # batched pipeline (or the model itself)
 
     def load(self) -> None:
         _register_cuda_dlls()
-        from faster_whisper import WhisperModel
+        from faster_whisper import BatchedInferencePipeline, WhisperModel
 
         self._model = WhisperModel(
             self._cfg["model"],
             device=self._cfg.get("device", "cuda"),
             compute_type=self._cfg.get("compute_type", "float16"),
         )
+        if self._cfg.get("batched", True):
+            self._pipe = BatchedInferencePipeline(model=self._model)
+        else:
+            self._pipe = self._model
 
     def transcribe(self, audio: np.ndarray, sample_rate: int) -> str:
         if self._model is None:
@@ -79,12 +84,23 @@ class Transcriber:
         if rms < float(self._cfg["min_rms"]):
             return ""
 
-        segments, _info = self._model.transcribe(
-            audio,
-            language="en",
-            vad_filter=True,
-            beam_size=int(self._cfg.get("beam_size", 1)),
-        )
+        beam = int(self._cfg.get("beam_size", 1))
+        if self._cfg.get("batched", True):
+            segments, _info = self._pipe.transcribe(
+                audio,
+                language="en",
+                beam_size=beam,
+                batch_size=int(self._cfg.get("batch_size", 16)),
+                condition_on_previous_text=False,
+            )
+        else:
+            segments, _info = self._model.transcribe(
+                audio,
+                language="en",
+                vad_filter=True,
+                beam_size=beam,
+                condition_on_previous_text=False,
+            )
 
         parts: list[str] = []
         for seg in segments:

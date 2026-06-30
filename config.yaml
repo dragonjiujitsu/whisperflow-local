@@ -14,6 +14,8 @@ stt:
   device: "cuda"                 # falls back to cpu if cuda check fails
   compute_type: "float16"        # int8_float16 on tight VRAM
   beam_size: 1                   # greedy = much faster for short dictation
+  batched: true                  # parallel-chunk inference (2-4x on GPU)
+  batch_size: 16
   # confidence gates — drop empty/hallucinated output (no paste)
   min_duration_s: 0.4
   min_rms: 0.005
@@ -23,7 +25,7 @@ stt:
 cleanup:
   # NOTE: plan pinned qwen2.5:7b-instruct; switched to qwen3.5:4b — already
   # installed locally, newer family, faster. One-line swap to change.
-  model: "qwen3.5:4b"
+  model: "qwen3.5:4b"           # sweet spot: fast (~1.2s) + follows /no_think (2b ignored it -> 8s)
   keep_alive: "30m"              # keep the model warm between dictations
   max_expansion_ratio: 2.5       # reject output longer than input * ratio (anti-injection)
   options:
