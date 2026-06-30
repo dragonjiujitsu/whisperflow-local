@@ -25,7 +25,7 @@ stt:
 cleanup:
   # NOTE: plan pinned qwen2.5:7b-instruct; switched to qwen3.5:4b — already
   # installed locally, newer family, faster. One-line swap to change.
-  model: "qwen3.5:4b"           # sweet spot: fast (~1.2s) + follows /no_think (2b ignored it -> 8s)
+  model: "granite4.1:3b"        # pure instruct (non-reasoning) — no /no_think hack needed
   keep_alive: "30m"              # keep the model warm between dictations
   max_expansion_ratio: 2.5       # reject output longer than input * ratio (anti-injection)
   options:
