@@ -129,6 +129,17 @@ def doctor() -> int:
     for name, ok, detail in checks:
         print(f"  {'OK  ' if ok else 'FAIL'} {name}: {detail}")
         ok_all = ok_all and ok
+
+    # autostart status (informational — not a pass/fail gate)
+    try:
+        from . import autostart
+
+        state = "installed" if autostart.is_installed() else "not installed"
+        print(f"  INFO autostart: {state} "
+              f"(toggle: install-autostart / uninstall-autostart)")
+    except Exception as exc:
+        print(f"  INFO autostart: unknown ({exc})")
+
     print(f"\ndoctor {'PASS' if ok_all else 'FAIL'}")
     return 0 if ok_all else 1
 
@@ -261,18 +272,46 @@ def run() -> int:
     from .app import Controller
     from .hotkey import HotkeyListener
 
+    from .tray import make_tray
+
     cfg = load_config()
     qapp = QApplication.instance() or QApplication(sys.argv)
+    # the pill hides between dictations; don't let that quit the app
+    qapp.setQuitOnLastWindowClosed(False)
     ctrl = Controller(cfg)
     print("[run] warming up models...")
     ctrl.warmup()
     listener = HotkeyListener(cfg.hotkey_combo, ctrl.on_hotkey)
     listener.start()
-    print(f"[run] ready. Toggle with {cfg.hotkey_combo}. Ctrl+C to quit.")
+
+    # tray presence + clean quit (no Task Manager needed)
+    tray = make_tray(cfg.hotkey_combo, qapp.quit)  # keep ref alive
+
+    print(f"[run] ready. Toggle with {cfg.hotkey_combo}. Quit via tray or Ctrl+C.")
     try:
         return qapp.exec()
     finally:
         listener.stop()
+        tray.hide()
+
+
+def install_autostart() -> int:
+    from . import autostart
+
+    path = autostart.install()
+    print(f"[autostart] installed -> {path}")
+    print("[autostart] whisperflow-local will launch (windowless) on next login.")
+    return 0
+
+
+def uninstall_autostart() -> int:
+    from . import autostart
+
+    if autostart.uninstall():
+        print("[autostart] removed; will no longer launch on login.")
+    else:
+        print("[autostart] nothing to remove (was not installed).")
+    return 0
 
 
 def main() -> int:
@@ -283,7 +322,14 @@ def main() -> int:
         return selftest()
     if cmd == "run":
         return run()
-    print(f"unknown command: {cmd}\nusage: python -m whisperflow_local [doctor|run|selftest]")
+    if cmd == "install-autostart":
+        return install_autostart()
+    if cmd == "uninstall-autostart":
+        return uninstall_autostart()
+    print(
+        f"unknown command: {cmd}\nusage: python -m whisperflow_local "
+        "[doctor|run|selftest|install-autostart|uninstall-autostart]"
+    )
     return 2
 
 

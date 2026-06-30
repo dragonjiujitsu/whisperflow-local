@@ -67,6 +67,7 @@ class VoicePill(QWidget):
         self._level = 0.0
         self._smooth = 0.0
         self._t = 0.0
+        self._error = False  # red failure flash (no text was inserted)
 
         # stable per-thread character (seeded once so threads don't flicker)
         rng = np.random.default_rng(7)
@@ -96,6 +97,9 @@ class VoicePill(QWidget):
         self._level = max(0.0, min(1.0, rms))
 
     def show_pill(self) -> None:
+        # clear any in-flight error flash so its pending hide-timer no-ops
+        # instead of yanking the pill out of a fresh recording
+        self._error = False
         self._position_bottom_center()
         self.show()
         if sys.platform == "win32":
@@ -105,6 +109,27 @@ class VoicePill(QWidget):
     def hide_pill(self) -> None:
         self._tick.stop()
         self.hide()
+
+    @Slot()
+    def flash_error(self) -> None:
+        """Briefly show the pill in a red 'failed — nothing inserted' state, then
+        hide. Safe to call when the pill is already hidden (post-processing)."""
+        self._error = True
+        self._smooth = 0.0
+        self._level = 0.0
+        self._position_bottom_center()
+        self.show()
+        if sys.platform == "win32":
+            _apply_passthrough_styles(int(self.winId()))
+        self._tick.start()
+        QTimer.singleShot(900, self._end_error)
+
+    def _end_error(self) -> None:
+        # only tear down if still in the error state; a new recording (show_pill)
+        # clears _error and must not be hidden by this stale one-shot
+        if self._error:
+            self._error = False
+            self.hide_pill()
 
     # -- internals ------------------------------------------------------------
     def _position_bottom_center(self) -> None:
@@ -154,12 +179,16 @@ class VoicePill(QWidget):
             sp.addRoundedRect(sr, radius + i, radius + i)
             p.fillPath(sp, QColor(0, 0, 0, a))
 
-        # warm cream body (clearly off-white, not pure white)
+        # body: warm cream normally; a soft red wash on failure
         body = QPainterPath()
         body.addRoundedRect(rect, radius, radius)
         bg = QLinearGradient(0, rect.top(), 0, rect.bottom())
-        bg.setColorAt(0.0, QColor(240, 234, 223, 242))
-        bg.setColorAt(1.0, QColor(228, 221, 207, 244))
+        if self._error:
+            bg.setColorAt(0.0, QColor(238, 206, 200, 244))
+            bg.setColorAt(1.0, QColor(226, 188, 181, 246))
+        else:
+            bg.setColorAt(0.0, QColor(240, 234, 223, 242))
+            bg.setColorAt(1.0, QColor(228, 221, 207, 244))
         p.fillPath(body, bg)
 
         p.setClipPath(body)
@@ -203,8 +232,11 @@ class VoicePill(QWidget):
 
         p.setClipping(False)
 
-        # warm, more-present hairline border
-        p.setPen(QPen(QColor(116, 106, 88, 130), 1.2))
+        # hairline border — warm normally, red on failure
+        if self._error:
+            p.setPen(QPen(QColor(176, 58, 48, 210), 1.8))
+        else:
+            p.setPen(QPen(QColor(116, 106, 88, 130), 1.2))
         p.setBrush(Qt.NoBrush)
         p.drawRoundedRect(rect, radius, radius)
         p.end()

@@ -33,8 +33,10 @@ CLEANUP_TIMEOUT_S = 30.0
 class Controller(QObject):
     # cross-thread signals (hotkey/worker -> Qt main thread)
     toggle_requested = Signal()
+    cancel_requested = Signal()
     show_overlay = Signal()
     hide_overlay = Signal()
+    fail_signal = Signal(str)  # worker -> main: nothing inserted (empty/abort/error)
 
     def __init__(self, cfg: Config) -> None:
         super().__init__()
@@ -59,8 +61,10 @@ class Controller(QObject):
         self._pump.timeout.connect(self._drain_rms)
 
         self.toggle_requested.connect(self._on_toggle)
+        self.cancel_requested.connect(self._on_cancel)
         self.show_overlay.connect(self._show)
         self.hide_overlay.connect(self._hide)
+        self.fail_signal.connect(self._on_fail)
 
     # -- called from the pynput thread ---------------------------------------
     def on_hotkey(self) -> None:
@@ -73,6 +77,18 @@ class Controller(QObject):
         elif self.state == RECORDING:
             self._stop_and_process()
         # PROCESSING: ignored (no reentrancy)
+
+    def _on_cancel(self) -> None:
+        """Esc during RECORDING: discard audio, no STT/cleanup/paste."""
+        if self.state != RECORDING:
+            return
+        self.state = IDLE
+        self._stop_enter_stop()
+        self._pump.stop()
+        self.hide_overlay.emit()
+        self.recorder.stop()  # drop the buffer; nothing is processed
+        self._beep_cancel()
+        self.log.info("state=IDLE (cancelled)")
 
     def _start_recording(self) -> None:
         self.state = RECORDING
@@ -106,6 +122,7 @@ class Controller(QObject):
                 self.log.info("stt=empty -> no insert")
                 print(f"[timing] stt={ (t_stt-t0)*1000:.0f}ms -> empty, no insert",
                       flush=True)
+                self.fail_signal.emit("no speech detected")
                 return
             cleaned = _with_timeout(
                 lambda: self.cleaner.clean(transcript), CLEANUP_TIMEOUT_S, transcript
@@ -113,6 +130,8 @@ class Controller(QObject):
             t_clean = time.perf_counter()
             ok, reason = self.inserter.insert(cleaned, target)
             t_ins = time.perf_counter()
+            if not ok:
+                self.fail_signal.emit(reason or "insert failed")
             audio_s = audio.size / self._sr
             print(
                 f"[timing] audio={audio_s:.1f}s | stt={(t_stt-t0)*1000:.0f}ms "
@@ -128,20 +147,35 @@ class Controller(QObject):
             )
         except Exception as exc:  # guarantee return to IDLE
             self.log.exception("process error: %s", type(exc).__name__)
+            self.fail_signal.emit(f"error: {type(exc).__name__}")
         finally:
             self.state = IDLE
             self.log.info("state=IDLE")
 
-    # -- Enter-to-finish (active only during RECORDING) -----------------------
+    # -- main-thread slot: surface a silent failure to the user ---------------
+    def _on_fail(self, reason: str) -> None:
+        self.log.info("fail reason=%s", reason)
+        print(f"[fail] {reason} — nothing inserted", flush=True)
+        self.pill.flash_error()
+        self._beep_error()
+
+    # -- Enter-to-finish / Esc-to-cancel (active only during RECORDING) -------
     def _start_enter_stop(self) -> None:
         VK_RETURN = 0x0D
+        VK_ESCAPE = 0x1B
 
         def win32_filter(msg, data):
-            if data.vkCode == VK_RETURN and self.state == RECORDING:
+            if self.state != RECORDING:
+                return
+            if data.vkCode == VK_RETURN:
                 # Trigger the stop FIRST: suppress_event() raises a sentinel to
                 # swallow the keystroke (no stray newline), so anything after it
                 # would be dead code.
                 self.toggle_requested.emit()
+                self._enter_listener.suppress_event()
+            elif data.vkCode == VK_ESCAPE:
+                # Discard the recording; swallow the Esc so it doesn't leak.
+                self.cancel_requested.emit()
                 self._enter_listener.suppress_event()
 
         self._enter_listener = keyboard.Listener(
@@ -179,6 +213,27 @@ class Controller(QObject):
 
         sound.play_tone(
             float(freq),
+            int(self._sound.get("duration_ms", 110)),
+            float(self._sound.get("volume", 0.06)),
+        )
+
+    def _beep_error(self) -> None:
+        if not self._sound.get("enabled", False):
+            return
+        from . import sound
+
+        sound.play_error(
+            float(self._sound.get("error_freq", 196)),
+            float(self._sound.get("volume", 0.06)),
+        )
+
+    def _beep_cancel(self) -> None:
+        if not self._sound.get("enabled", False):
+            return
+        from . import sound
+
+        sound.play_tone(
+            float(self._sound.get("cancel_freq", 311)),
             int(self._sound.get("duration_ms", 110)),
             float(self._sound.get("volume", 0.06)),
         )

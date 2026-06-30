@@ -57,6 +57,8 @@ sound:
   enabled: true                  # soft sine cue when recording starts/stops
   start_freq: 587                # Hz (D5 — gentle)
   stop_freq: 440                 # Hz (A4 — lower, softer)
+  error_freq: 196                # Hz (G3 — low double-buzz on failure)
+  cancel_freq: 311               # Hz (Eb4 — short descending blip on cancel)
   duration_ms: 120
   volume: 0.05                   # quiet; raise toward 0.15 if too soft
 
