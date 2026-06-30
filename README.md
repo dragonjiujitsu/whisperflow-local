@@ -6,6 +6,8 @@ removed, grammar/punctuation fixed) is inserted into whatever text field has
 focus. STT and the cleanup LLM both run on-device — **no cloud calls at dictation
 time.**
 
+![whisperflow-local](assets/architecture.png)
+
 Built as the worked example for a YouTube video whose real deliverable is the
 *process*: deep-research → grill → cross-model plan review → Claude Code builds.
 See `PLAN.md` (the locked spec), `PLAN-REVIEW-LOG.md` (the Claude↔Codex argument
