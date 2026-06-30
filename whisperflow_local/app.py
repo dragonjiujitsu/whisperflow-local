@@ -26,14 +26,16 @@ from .stt import Transcriber
 
 IDLE, RECORDING, PROCESSING = "IDLE", "RECORDING", "PROCESSING"
 
-STT_TIMEOUT_S = 30.0
-CLEANUP_TIMEOUT_S = 30.0
+# sized for up to a ~5 min dictation (batch STT + LLM cleanup both run at stop)
+STT_TIMEOUT_S = 90.0
+CLEANUP_TIMEOUT_S = 90.0
 
 
 class Controller(QObject):
     # cross-thread signals (hotkey/worker -> Qt main thread)
     toggle_requested = Signal()
     cancel_requested = Signal()
+    overflow_signal = Signal()  # audio callback -> main: hit max_seconds, finalize
     show_overlay = Signal()
     hide_overlay = Signal()
     fail_signal = Signal(str)  # worker -> main: nothing inserted (empty/abort/error)
@@ -45,7 +47,11 @@ class Controller(QObject):
         self.state = IDLE
 
         self.rms_q: "queue.Queue[float]" = queue.Queue(maxsize=64)
-        self.recorder = Recorder(cfg.audio, self.rms_q)
+        # on max_seconds overflow the (PortAudio-thread) callback emits a queued
+        # Qt signal so the finalize happens on the main thread, like a real stop
+        self.recorder = Recorder(
+            cfg.audio, self.rms_q, on_overflow=self.overflow_signal.emit
+        )
         self.stt = Transcriber(cfg.stt)
         self.cleaner = Cleaner(cfg.cleanup)
         self.inserter = Inserter(cfg.insert)
@@ -62,6 +68,7 @@ class Controller(QObject):
 
         self.toggle_requested.connect(self._on_toggle)
         self.cancel_requested.connect(self._on_cancel)
+        self.overflow_signal.connect(self._on_overflow)
         self.show_overlay.connect(self._show)
         self.hide_overlay.connect(self._hide)
         self.fail_signal.connect(self._on_fail)
@@ -77,6 +84,15 @@ class Controller(QObject):
         elif self.state == RECORDING:
             self._stop_and_process()
         # PROCESSING: ignored (no reentrancy)
+
+    def _on_overflow(self) -> None:
+        """Hit max_seconds: finalize exactly like a manual stop (transcribe what
+        was said and insert it) instead of dropping the session silently."""
+        if self.state != RECORDING:
+            return
+        self.log.info("max_seconds reached -> auto-finalize")
+        print("[overflow] max recording length reached — finalizing", flush=True)
+        self._stop_and_process()
 
     def _on_cancel(self) -> None:
         """Esc during RECORDING: discard audio, no STT/cleanup/paste."""
@@ -131,7 +147,13 @@ class Controller(QObject):
             ok, reason = self.inserter.insert(cleaned, target)
             t_ins = time.perf_counter()
             if not ok:
-                self.fail_signal.emit(reason or "insert failed")
+                # don't lose the words: leave the cleaned text on the clipboard
+                # so the user can paste it manually (esp. on focus_changed)
+                stashed = self._stash_to_clipboard(cleaned)
+                detail = reason or "insert failed"
+                self.fail_signal.emit(
+                    f"{detail} — text on clipboard" if stashed else detail
+                )
             audio_s = audio.size / self._sr
             print(
                 f"[timing] audio={audio_s:.1f}s | stt={(t_stt-t0)*1000:.0f}ms "
@@ -151,6 +173,17 @@ class Controller(QObject):
         finally:
             self.state = IDLE
             self.log.info("state=IDLE")
+
+    def _stash_to_clipboard(self, text: str) -> bool:
+        """Best-effort: put uninserted text on the clipboard for manual paste."""
+        try:
+            import pyperclip
+
+            pyperclip.copy(text)
+            return True
+        except Exception as exc:
+            self.log.warning("clipboard stash failed: %s", exc)
+            return False
 
     # -- main-thread slot: surface a silent failure to the user ---------------
     def _on_fail(self, reason: str) -> None:

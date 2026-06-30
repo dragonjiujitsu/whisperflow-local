@@ -9,17 +9,24 @@ from __future__ import annotations
 
 import math
 import queue
+from typing import Callable
 
 import numpy as np
 import sounddevice as sd
 
 
 class Recorder:
-    def __init__(self, cfg: dict, rms_queue: "queue.Queue[float]") -> None:
+    def __init__(
+        self,
+        cfg: dict,
+        rms_queue: "queue.Queue[float]",
+        on_overflow: Callable[[], None] | None = None,
+    ) -> None:
         self._sr = int(cfg["sample_rate"])
         self._channels = int(cfg["channels"])
         self._max_samples = int(cfg["max_seconds"]) * self._sr
         self._rms_q = rms_queue
+        self._on_overflow = on_overflow
 
         self._buf = np.zeros(self._max_samples, dtype=np.float32)
         self._write = 0
@@ -45,6 +52,12 @@ class Recorder:
             self._buf[self._write:end] = indata[:frames, 0]
             self._write = end
         if self.overflowed:
+            # notify the controller to finalize on the main thread, then stop
+            if self._on_overflow is not None:
+                try:
+                    self._on_overflow()
+                except Exception:
+                    pass
             raise sd.CallbackStop()
 
     def start(self) -> None:

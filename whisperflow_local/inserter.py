@@ -70,18 +70,20 @@ def _clipboard_has_nontext() -> bool:
         win32clipboard.OpenClipboard()
         try:
             fmt = win32clipboard.EnumClipboardFormats(0)
+            # formats our save/restore (pyperclip, plain text only) can round-trip
             text_formats = {win32con.CF_TEXT, win32con.CF_UNICODETEXT,
                             win32con.CF_OEMTEXT, win32con.CF_LOCALE}
-            has_text = False
             has_other = False
             while fmt:
-                if fmt in text_formats:
-                    has_text = True
-                else:
+                if fmt not in text_formats:
                     has_other = True
+                    break
                 fmt = win32clipboard.EnumClipboardFormats(fmt)
-            # rich/binary content present that we can't preserve -> avoid paste
-            return has_other and not has_text or (has_other and has_text is False)
+            # ANY non-text format present (image, RTF/HTML, files) can't survive a
+            # plain-text save/restore -> route to type() rather than clobber it.
+            # This includes the text+rich mix (e.g. copied from Word), which the
+            # previous logic wrongly sent to paste and destroyed.
+            return has_other
         finally:
             win32clipboard.CloseClipboard()
     except Exception:
