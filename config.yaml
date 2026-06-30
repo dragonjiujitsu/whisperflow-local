@@ -1,7 +1,7 @@
 # whisperflow-local configuration. All runtime knobs live here.
 
 hotkey:
-  combo: "<ctrl>+<alt>+<space>"   # global toggle chord
+  combo: "<scroll_lock>"          # dedicated dead key — near-zero collision, no AltGr
 
 audio:
   sample_rate: 16000              # faster-whisper expects 16kHz mono
@@ -40,6 +40,7 @@ cleanup:
 insert:
   mode: "paste"                  # paste | type
   settle_delay_s: 0.15           # wait before restoring clipboard after Ctrl+V
+  press_enter_after: false       # do NOT auto-submit; user reviews then sends
 
 overlay:
   enabled: true

@@ -13,6 +13,7 @@ import queue
 import threading
 import time
 
+from pynput import keyboard
 from PySide6.QtCore import QObject, QTimer, Signal
 
 from .applog import get_logger
@@ -49,6 +50,7 @@ class Controller(QObject):
 
         self.pill = VoicePill()
         self._sr = int(cfg.audio["sample_rate"])
+        self._enter_listener: keyboard.Listener | None = None
 
         # overlay level pump (main-thread timer)
         self._pump = QTimer(self)
@@ -76,10 +78,12 @@ class Controller(QObject):
         self.recorder.start()
         self.show_overlay.emit()
         self._pump.start()
+        self._start_enter_stop()  # Enter also finishes (only while recording)
         self.log.info("state=RECORDING")
 
     def _stop_and_process(self) -> None:
         self.state = PROCESSING
+        self._stop_enter_stop()
         self._pump.stop()
         self.hide_overlay.emit()
         target = capture_focus_target()  # snapshot focus at STOP
@@ -106,6 +110,28 @@ class Controller(QObject):
         finally:
             self.state = IDLE
             self.log.info("state=IDLE")
+
+    # -- Enter-to-finish (active only during RECORDING) -----------------------
+    def _start_enter_stop(self) -> None:
+        VK_RETURN = 0x0D
+
+        def win32_filter(msg, data):
+            if data.vkCode == VK_RETURN and self.state == RECORDING:
+                # Trigger the stop FIRST: suppress_event() raises a sentinel to
+                # swallow the keystroke (no stray newline), so anything after it
+                # would be dead code.
+                self.toggle_requested.emit()
+                self._enter_listener.suppress_event()
+
+        self._enter_listener = keyboard.Listener(
+            on_press=lambda k: None, win32_event_filter=win32_filter
+        )
+        self._enter_listener.start()
+
+    def _stop_enter_stop(self) -> None:
+        if self._enter_listener is not None:
+            self._enter_listener.stop()
+            self._enter_listener = None
 
     def _drain_rms(self) -> None:
         level = 0.0

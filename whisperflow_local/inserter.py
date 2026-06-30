@@ -92,6 +92,7 @@ class Inserter:
     def __init__(self, cfg: dict) -> None:
         self._mode = cfg.get("mode", "paste")
         self._settle = float(cfg.get("settle_delay_s", 0.15))
+        self._press_enter = bool(cfg.get("press_enter_after", False))
         self._kb = Controller()
 
     def insert(self, text: str, target: FocusTarget) -> tuple[bool, str]:
@@ -103,8 +104,12 @@ class Inserter:
             return False, "focus_changed"
 
         if self._mode == "type" or _clipboard_has_nontext():
-            return self._type(text)
-        return self._paste(text)
+            ok, reason = self._type(text)
+        else:
+            ok, reason = self._paste(text)
+        if ok and self._press_enter:
+            self._kb.tap(Key.enter)
+        return ok, reason
 
     # -- strategies -----------------------------------------------------------
     def _type(self, text: str) -> tuple[bool, str]:
