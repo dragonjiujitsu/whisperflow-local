@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.uv/
+dist/
+build/
+*.egg-info/
+logs/
+*.log
+models/
