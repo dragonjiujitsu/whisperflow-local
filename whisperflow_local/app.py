@@ -161,8 +161,9 @@ class Controller(QObject):
                 level = self.rms_q.get_nowait()
         except queue.Empty:
             pass
-        # scale RMS (~0..0.2 typical speech) into 0..1
-        self.pill.set_level(min(1.0, level * 6.0))
+        # perceptual scaling: a power curve lifts quiet/normal speech so the
+        # waves react well below shouting volume (linear felt dead at low input)
+        self.pill.set_level(min(1.0, (level * 7.0) ** 0.55))
 
     def _show(self) -> None:
         if self.cfg.overlay.get("enabled", True):
