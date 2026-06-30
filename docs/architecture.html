@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>whisperflow-local · architecture</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300..600;1,9..144,300..500&family=Hanken+Grotesk:wght@300;400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --paper:#ece4d6;        /* page */
+    --cream-top:#f1ebe0;    /* card top */
+    --cream-bot:#e6dfd0;    /* card bottom */
+    --ink:#1b1b20;
+    --ink-soft:#4c4840;
+    --ink-faint:#86806f;
+    --brass:#746a58;
+    --brass-bright:#9c8a64;
+    --line:rgba(116,106,88,.30);
+    --line-strong:rgba(116,106,88,.5);
+    --shadow:28px 40px 80px -40px rgba(40,34,22,.45);
+    --r:26px;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    background:var(--paper);
+    color:var(--ink);
+    font-family:"Hanken Grotesk",system-ui,sans-serif;
+    font-weight:400;
+    line-height:1.6;
+    -webkit-font-smoothing:antialiased;
+    overflow-x:hidden;
+  }
+  /* paper grain overlay */
+  body::after{
+    content:"";position:fixed;inset:0;pointer-events:none;z-index:200;
+    opacity:.40;mix-blend-mode:multiply;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  }
+  /* soft warm vignette for depth */
+  body::before{
+    content:"";position:fixed;inset:0;pointer-events:none;z-index:1;
+    background:radial-gradient(120% 80% at 50% -10%, rgba(255,250,240,.6), transparent 60%),
+               radial-gradient(120% 90% at 50% 120%, rgba(120,100,70,.14), transparent 55%);
+  }
+
+  .wrap{max-width:1180px;margin:0 auto;padding:0 40px;position:relative;z-index:2}
+
+  /* ---------- eyebrow / section headers ---------- */
+  .eyebrow{
+    font-family:"IBM Plex Mono",monospace;
+    font-size:.72rem;letter-spacing:.32em;text-transform:uppercase;
+    color:var(--brass);font-weight:500;
+    display:flex;align-items:center;gap:14px;
+  }
+  .eyebrow::before{content:"";width:34px;height:1px;background:var(--brass);opacity:.7}
+
+  h2.section{
+    font-family:"Fraunces",serif;font-weight:400;
+    font-size:clamp(1.9rem,4vw,3rem);line-height:1.05;
+    letter-spacing:-.02em;margin:18px 0 0;max-width:18ch;
+  }
+  h2.section em{font-style:italic;color:var(--brass-bright)}
+  .section-lead{
+    color:var(--ink-soft);font-size:1.05rem;max-width:54ch;margin-top:18px;font-weight:300;
+  }
+
+  /* ---------- HERO ---------- */
+  header.hero{
+    min-height:100vh;display:flex;flex-direction:column;justify-content:center;
+    padding:80px 0 60px;position:relative;
+  }
+  .hero-top{
+    display:flex;justify-content:space-between;align-items:center;
+    position:absolute;top:34px;left:40px;right:40px;
+    font-family:"IBM Plex Mono",monospace;font-size:.72rem;letter-spacing:.22em;
+    text-transform:uppercase;color:var(--ink-faint);
+  }
+  .hero-top .dot{display:inline-block;width:7px;height:7px;border-radius:50%;
+    background:var(--brass-bright);margin-right:9px;vertical-align:middle;
+    box-shadow:0 0 0 0 rgba(156,138,100,.55);animation:pulse 2.6s infinite}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(156,138,100,.5)}70%{box-shadow:0 0 0 9px rgba(156,138,100,0)}100%{box-shadow:0 0 0 0 rgba(156,138,100,0)}}
+
+  .hero-grid{display:grid;grid-template-columns:1.05fr .95fr;gap:60px;align-items:center}
+
+  .hero h1{
+    font-family:"Fraunces",serif;font-weight:300;
+    font-size:clamp(2.8rem,6.4vw,5.4rem);line-height:.96;letter-spacing:-.035em;
+  }
+  .hero h1 .local{font-style:italic;font-weight:400;color:var(--brass-bright)}
+  .hero .tag{
+    font-size:1.18rem;color:var(--ink-soft);margin-top:26px;max-width:34ch;font-weight:300;
+  }
+  .hero .tag b{color:var(--ink);font-weight:600}
+  .keycue{
+    margin-top:38px;display:inline-flex;align-items:center;gap:12px;
+    font-family:"IBM Plex Mono",monospace;font-size:.82rem;color:var(--ink-soft);
+  }
+  kbd{
+    font-family:"IBM Plex Mono",monospace;font-size:.82rem;
+    background:linear-gradient(180deg,#f4eee3,#e7e0d0);
+    border:1px solid var(--line-strong);border-bottom-width:2px;
+    border-radius:7px;padding:5px 11px;color:var(--ink);
+    box-shadow:0 1px 0 rgba(255,255,255,.6) inset;
+  }
+
+  /* the sand-pill logo card with live waveform */
+  .pill-card{
+    position:relative;border-radius:var(--r);
+    background:linear-gradient(180deg,var(--cream-top),var(--cream-bot));
+    border:1px solid var(--line-strong);
+    box-shadow:var(--shadow), 0 1px 0 rgba(255,255,255,.5) inset;
+    aspect-ratio:1/1;overflow:hidden;
+    display:flex;align-items:center;justify-content:center;
+  }
+  .pill-card canvas{width:100%;height:100%;display:block}
+  .pill-card .grain{position:absolute;inset:0;opacity:.5;mix-blend-mode:multiply;pointer-events:none;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='m'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='1.1' numOctaves='2'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23m)'/%3E%3C/svg%3E")}
+
+  .scrollhint{
+    position:absolute;bottom:30px;left:50%;transform:translateX(-50%);
+    font-family:"IBM Plex Mono",monospace;font-size:.66rem;letter-spacing:.3em;
+    text-transform:uppercase;color:var(--ink-faint);text-align:center;
+  }
+  .scrollhint span{display:block;font-size:1rem;margin-top:6px;animation:bob 2s ease-in-out infinite}
+  @keyframes bob{0%,100%{transform:translateY(0)}50%{transform:translateY(5px)}}
+
+  /* ---------- generic section spacing ---------- */
+  section{padding:92px 0}
+  .section-head{margin-bottom:56px}
+
+  /* ---------- PIPELINE ---------- */
+  .flow{display:grid;grid-template-columns:repeat(5,1fr);gap:0;position:relative}
+  .stage{
+    position:relative;padding:30px 22px;text-align:left;
+  }
+  .stage:not(:last-child)::after{
+    content:"";position:absolute;top:54px;right:-1px;width:2px;height:calc(100% - 54px);
+    background:linear-gradient(var(--line),transparent);
+  }
+  .stage .num{
+    font-family:"IBM Plex Mono",monospace;font-size:.7rem;color:var(--brass);
+    letter-spacing:.2em;
+  }
+  .stage .arrow{
+    position:absolute;top:44px;right:-9px;z-index:3;color:var(--brass-bright);
+    font-size:1rem;background:var(--paper);padding:2px 0;
+  }
+  .stage h3{
+    font-family:"Fraunces",serif;font-weight:450;font-size:1.34rem;
+    margin:14px 0 8px;letter-spacing:-.01em;line-height:1.1;
+  }
+  .stage p{font-size:.93rem;color:var(--ink-soft);font-weight:300;line-height:1.5}
+  .stage .meta{
+    margin-top:12px;font-family:"IBM Plex Mono",monospace;font-size:.7rem;
+    color:var(--ink-faint);letter-spacing:.02em;
+  }
+  .flow-rail{
+    margin-top:30px;height:1px;background:var(--line);position:relative;
+  }
+  .flow-rail .runner{
+    position:absolute;top:-2px;left:0;width:60px;height:5px;border-radius:3px;
+    background:linear-gradient(90deg,transparent,var(--brass-bright),transparent);
+    animation:run 5.5s linear infinite;
+  }
+  @keyframes run{0%{left:-10%}100%{left:100%}}
+  .local-stamp{
+    display:inline-flex;align-items:center;gap:9px;margin-top:34px;
+    font-family:"IBM Plex Mono",monospace;font-size:.72rem;letter-spacing:.12em;
+    color:var(--brass);border:1px solid var(--line);border-radius:30px;padding:8px 16px;
+    background:linear-gradient(180deg,rgba(255,255,255,.35),transparent);
+  }
+  .local-stamp b{color:var(--ink);font-weight:600}
+
+  /* ---------- THREADING ---------- */
+  .lanes{display:flex;flex-direction:column;gap:18px;margin-top:8px}
+  .lane{
+    display:grid;grid-template-columns:230px 1fr;gap:0;align-items:stretch;
+    border:1px solid var(--line);border-radius:18px;overflow:hidden;
+    background:linear-gradient(180deg,rgba(255,255,255,.28),transparent);
+  }
+  .lane .label{
+    padding:22px 24px;border-right:1px solid var(--line);
+    display:flex;flex-direction:column;justify-content:center;gap:6px;
+    background:linear-gradient(180deg,var(--cream-top),var(--cream-bot));
+  }
+  .lane .label .k{font-family:"IBM Plex Mono",monospace;font-size:.66rem;
+    letter-spacing:.2em;text-transform:uppercase;color:var(--brass)}
+  .lane .label .n{font-family:"Fraunces",serif;font-size:1.18rem;font-weight:450;letter-spacing:-.01em}
+  .lane .body{padding:22px 26px;display:flex;flex-wrap:wrap;align-items:center;gap:12px}
+  .node{
+    font-family:"IBM Plex Mono",monospace;font-size:.78rem;color:var(--ink);
+    border:1px solid var(--line-strong);border-radius:9px;padding:8px 13px;
+    background:linear-gradient(180deg,#f4eee3,#eae2d2);white-space:nowrap;
+  }
+  .node.muted{color:var(--ink-faint);background:transparent;border-style:dashed}
+  .sig{color:var(--brass-bright);font-size:1.05rem;font-family:"IBM Plex Mono",monospace}
+  .lane.ui{border-color:var(--line-strong)}
+  .thread-note{margin-top:22px;font-size:.9rem;color:var(--ink-faint);font-weight:300;
+    font-family:"IBM Plex Mono",monospace;letter-spacing:.02em}
+
+  /* ---------- DECISIONS ---------- */
+  .cards{display:grid;grid-template-columns:1fr 1fr;gap:22px}
+  .card{
+    position:relative;border-radius:20px;padding:34px 32px 32px;
+    background:linear-gradient(180deg,var(--cream-top),var(--cream-bot));
+    border:1px solid var(--line);box-shadow:18px 26px 50px -38px rgba(40,34,22,.4);
+    overflow:hidden;
+  }
+  .card .idx{font-family:"Fraunces",serif;font-style:italic;font-size:2.4rem;
+    color:var(--line-strong);position:absolute;top:18px;right:26px;line-height:1}
+  .card h3{font-family:"Fraunces",serif;font-weight:450;font-size:1.5rem;letter-spacing:-.015em;max-width:16ch}
+  .card p{color:var(--ink-soft);font-weight:300;margin-top:12px;font-size:.97rem;max-width:42ch}
+  .card .tradeoff{
+    margin-top:18px;padding-top:16px;border-top:1px solid var(--line);
+    font-family:"IBM Plex Mono",monospace;font-size:.72rem;color:var(--ink-faint);
+    letter-spacing:.02em;
+  }
+  .card .tradeoff b{color:var(--brass);font-weight:500}
+
+  /* ---------- footer ---------- */
+  footer{padding:70px 0 90px;border-top:1px solid var(--line);margin-top:40px}
+  .foot-grid{display:flex;justify-content:space-between;align-items:flex-end;gap:30px;flex-wrap:wrap}
+  footer .mark{font-family:"Fraunces",serif;font-size:1.5rem;font-weight:400;letter-spacing:-.01em}
+  footer .mark em{font-style:italic;color:var(--brass-bright)}
+  footer .meta{font-family:"IBM Plex Mono",monospace;font-size:.72rem;color:var(--ink-faint);
+    letter-spacing:.1em;text-transform:uppercase;text-align:right;line-height:2}
+
+  /* ---------- reveal animation ---------- */
+  .reveal{opacity:0;transform:translateY(22px);transition:opacity .9s cubic-bezier(.2,.7,.2,1),transform .9s cubic-bezier(.2,.7,.2,1)}
+  .reveal.in{opacity:1;transform:none}
+  /* respect reduced-motion: show everything at rest, no transitions/loops */
+  @media(prefers-reduced-motion:reduce){
+    .reveal{opacity:1!important;transform:none!important;transition:none!important}
+    .scrollhint span,.flow-rail .runner,.hero-top .dot{animation:none!important}
+  }
+
+  @media(max-width:880px){
+    .wrap{padding:0 24px}
+    .hero-grid{grid-template-columns:1fr;gap:40px}
+    .pill-card{max-width:380px;margin:0 auto;width:100%}
+    .flow{grid-template-columns:1fr 1fr}
+    .stage:not(:last-child)::after,.stage .arrow{display:none}
+    .cards{grid-template-columns:1fr}
+    .lane{grid-template-columns:1fr}
+    .lane .label{border-right:none;border-bottom:1px solid var(--line)}
+    .hero-top{position:static;justify-content:center;margin-bottom:30px}
+    header.hero{min-height:auto}
+  }
+</style>
+</head>
+<body>
+
+<!-- ===================== HERO ===================== -->
+<header class="hero">
+  <div class="wrap" style="width:100%">
+    <div class="hero-top">
+      <div><span class="dot"></span>whisperflow-local</div>
+      <div>v1 · windows · runtime offline</div>
+    </div>
+
+    <div class="hero-grid">
+      <div>
+        <div class="eyebrow reveal">100% local dictation</div>
+        <h1 class="reveal" style="transition-delay:.08s">whisperflow<span class="local">-local</span></h1>
+        <p class="tag reveal" style="transition-delay:.16s">A WhisperFlow clone whose runtime is <b>fully on-device</b>. Speak, and clean corrected text lands in whatever field has focus — <b>no cloud</b>, ever.</p>
+        <div class="keycue reveal" style="transition-delay:.24s">
+          tap <kbd>Ctrl</kbd><span style="opacity:.5">+</span><kbd>Win</kbd> to dictate · tap again to insert
+        </div>
+      </div>
+
+      <div class="pill-card reveal" style="transition-delay:.2s">
+        <canvas id="wave"></canvas>
+        <div class="grain"></div>
+      </div>
+    </div>
+  </div>
+  <div class="scrollhint">scroll<span>↓</span></div>
+</header>
+
+<!-- ===================== PIPELINE ===================== -->
+<section id="pipeline">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <div class="eyebrow">The runtime</div>
+      <h2 class="section">Five stages, one tap, <em>zero network.</em></h2>
+      <p class="section-lead">Every step below runs on your machine. The model weights download once at setup; at dictation time nothing leaves the device.</p>
+    </div>
+
+    <div class="flow reveal">
+      <div class="stage">
+        <div class="num">01</div><div class="arrow">→</div>
+        <h3>Toggle</h3>
+        <p>A global hotkey flips an explicit state machine: idle → recording.</p>
+        <div class="meta">Ctrl+Win · pynput</div>
+      </div>
+      <div class="stage">
+        <div class="num">02</div><div class="arrow">→</div>
+        <h3>Capture</h3>
+        <p>A lock-free audio callback writes mic frames into a ring buffer.</p>
+        <div class="meta">sounddevice · 16 kHz mono</div>
+      </div>
+      <div class="stage">
+        <div class="num">03</div><div class="arrow">→</div>
+        <h3>Transcribe</h3>
+        <p>Batched speech-to-text on the GPU, confidence-gated to drop silence.</p>
+        <div class="meta">faster-whisper · large-v3-turbo · CUDA</div>
+      </div>
+      <div class="stage">
+        <div class="num">04</div><div class="arrow">→</div>
+        <h3>Clean up</h3>
+        <p>A local LLM strips filler, fixes grammar, keeps your voice — kept warm.</p>
+        <div class="meta">Ollama · local instruct model</div>
+      </div>
+      <div class="stage">
+        <div class="num">05</div>
+        <h3>Insert</h3>
+        <p>Re-verify focus, then paste cleaned text into the live field.</p>
+        <div class="meta">clipboard · focus-safe</div>
+      </div>
+    </div>
+    <div class="flow-rail reveal"><div class="runner"></div></div>
+
+    <div class="local-stamp reveal"><span class="dot" style="position:static;width:7px;height:7px;border-radius:50%;background:var(--brass-bright);display:inline-block"></span> STT &amp; cleanup both run <b>on-device</b> — the entire reason to clone</div>
+  </div>
+</section>
+
+<!-- ===================== THREADING ===================== -->
+<section id="threads">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <div class="eyebrow">Concurrency</div>
+      <h2 class="section">Three lanes so the UI <em>never freezes.</em></h2>
+      <p class="section-lead">Audio capture, heavy inference, and the overlay each live on their own thread. Every cross-thread touch is marshalled through queued Qt signals — widgets are only ever touched on the main thread.</p>
+    </div>
+
+    <div class="lanes reveal">
+      <div class="lane">
+        <div class="label"><div class="k">Thread A</div><div class="n">Audio callback</div></div>
+        <div class="body">
+          <span class="node">PortAudio frames</span>
+          <span class="sig">→</span>
+          <span class="node">ring buffer</span>
+          <span class="sig">→</span>
+          <span class="node muted">RMS queue</span>
+          <span class="sig">⇢ signal</span>
+        </div>
+      </div>
+      <div class="lane">
+        <div class="label"><div class="k">Thread B</div><div class="n">STT + cleanup worker</div></div>
+        <div class="body">
+          <span class="node">faster-whisper</span>
+          <span class="sig">→</span>
+          <span class="node">Ollama cleanup</span>
+          <span class="sig">→</span>
+          <span class="node">focus-safe insert</span>
+          <span class="sig">⇢ signal</span>
+        </div>
+      </div>
+      <div class="lane ui">
+        <div class="label"><div class="k">Thread C</div><div class="n">Qt main / UI</div></div>
+        <div class="body">
+          <span class="node">state machine</span>
+          <span class="sig">→</span>
+          <span class="node">overlay pill</span>
+          <span class="sig">→</span>
+          <span class="node">tray icon</span>
+          <span class="node muted">fail flash · cues</span>
+        </div>
+      </div>
+    </div>
+    <div class="thread-note reveal">hotkey &amp; audio callbacks never touch a widget directly — they emit, the UI thread reacts.</div>
+  </div>
+</section>
+
+<!-- ===================== DECISIONS ===================== -->
+<section id="decisions">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <div class="eyebrow">Design decisions</div>
+      <h2 class="section">Opinions, with their <em>tradeoffs</em> named.</h2>
+    </div>
+
+    <div class="cards">
+      <div class="card reveal">
+        <div class="idx">i</div>
+        <h3>Runtime is 100% local</h3>
+        <p>Cleanup runs on a local Ollama model; cloud Haiku was explicitly ruled out. Only the one-time setup download touches the network.</p>
+        <div class="tradeoff"><b>cost</b> — you host the models &amp; the VRAM, in exchange for true privacy</div>
+      </div>
+      <div class="card reveal" style="transition-delay:.08s">
+        <div class="idx">ii</div>
+        <h3>Toggle, not hold-to-talk</h3>
+        <p>Tap to start, tap to finish. Easier on the hands for long dictation; an auto-finalize at five minutes guards a forgotten session.</p>
+        <div class="tradeoff"><b>cost</b> — needs a visible recording cue: the overlay pill</div>
+      </div>
+      <div class="card reveal" style="transition-delay:.04s">
+        <div class="idx">iii</div>
+        <h3>Paste, with focus re-verified</h3>
+        <p>Clipboard paste is instant block-insert. Focus is captured at stop and re-checked before paste — if you've moved, it aborts and stashes the text instead of leaking it.</p>
+        <div class="tradeoff"><b>cost</b> — a type() fallback for paste-hostile apps</div>
+      </div>
+      <div class="card reveal" style="transition-delay:.12s">
+        <div class="idx">iv</div>
+        <h3>A non-activating overlay</h3>
+        <p>The waveform pill is always-on-top yet never steals focus and passes clicks straight through — so paste still lands in your text field.</p>
+        <div class="tradeoff"><b>how</b> — WS_EX_NOACTIVATE | WS_EX_TRANSPARENT on the HWND</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== FOOTER ===================== -->
+<footer>
+  <div class="wrap foot-grid">
+    <div>
+      <div class="mark">whisperflow<em>-local</em></div>
+      <p style="color:var(--ink-faint);font-weight:300;margin-top:8px;max-width:40ch">Built as the worked example for a process: deep research → grill → cross-model plan review → Claude Code builds.</p>
+    </div>
+    <div class="meta">
+      python · uv · pyside6<br>
+      faster-whisper · ollama<br>
+      windows · runtime offline
+    </div>
+  </div>
+</footer>
+
+<script>
+/* ---------- live ink-thread waveform (ported from the app's overlay) ---------- */
+(function(){
+  const cv = document.getElementById('wave');
+  const ctx = cv.getContext('2d');
+  const THREADS = 46, PTS = 100;
+  let W=0,H=0,dpr=Math.min(window.devicePixelRatio||1,2);
+
+  // stable per-thread character
+  const ampScale=[],voff=[],wfreq=[],wphase=[],drift=[];
+  let s=7; const rnd=()=>{s=(s*1103515245+12345)&0x7fffffff;return s/0x7fffffff;};
+  for(let j=0;j<THREADS;j++){
+    ampScale.push(0.45+0.85*rnd());
+    voff.push(rnd()-0.5);
+    wfreq.push(2+6*rnd());
+    wphase.push(rnd()*Math.PI*2);
+    drift.push((rnd()-0.5)*0.6);
+  }
+  const fx=[];for(let k=0;k<PTS;k++)fx.push(k/(PTS-1));
+
+  function resize(){
+    const r=cv.getBoundingClientRect();
+    W=r.width;H=r.height;
+    cv.width=W*dpr;cv.height=H*dpr;
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+  }
+  window.addEventListener('resize',resize);resize();
+
+  function contour(x,t){
+    let base=0.50*Math.sin(2*Math.PI*1.6*x+t)
+            +0.30*Math.sin(2*Math.PI*2.7*x-t*0.7)
+            +0.20*Math.sin(2*Math.PI*4.3*x+t*1.3);
+    let sp=0;
+    for(let k=0;k<3;k++){
+      const c=0.5+0.5*Math.sin(t*(0.5+0.4*k)+k*2);
+      sp+=(0.6-0.18*k)*Math.exp(-((x-c)*(x-c))/(2*0.0016));
+      sp-=(0.4-0.10*k)*Math.exp(-((x-(1-c))*(x-(1-c)))/(2*0.0016));
+    }
+    return base+0.5*sp;
+  }
+
+  let t=0;
+  function frame(){
+    t+=0.016;
+    ctx.clearRect(0,0,W,H);
+    const padX=W*0.16, width=W*0.68, left=padX;
+    const cy=H*0.5, maxH=H*0.30;
+    const amp=maxH*0.92;
+    // precompute base contour for spread term
+    const bc=fx.map(x=>contour(x,t));
+    for(let j=0;j<THREADS;j++){
+      ctx.beginPath();
+      for(let k=0;k<PTS;k++){
+        const x=fx[k];
+        const edge=Math.pow(Math.sin(Math.PI*x),0.7);
+        const c=contour(x,t+drift[j]);
+        const wob=Math.sin(2*Math.PI*wfreq[j]*x+wphase[j]+t*1.1);
+        const spread=(maxH*0.5)*voff[j]*(0.25+0.75*Math.abs(bc[k]));
+        const y=cy + c*amp*ampScale[j]*edge + spread*edge + wob*(amp*0.10)*edge;
+        const px=left+x*width;
+        if(k===0)ctx.moveTo(px,y);else ctx.lineTo(px,y);
+      }
+      const a=(14+26*ampScale[j]/1.3)/255;
+      ctx.strokeStyle='rgba(24,24,28,'+a.toFixed(3)+')';
+      ctx.lineWidth=0.8;ctx.lineCap='round';
+      ctx.stroke();
+    }
+    requestAnimationFrame(frame);
+  }
+  frame();
+})();
+
+/* ---------- scroll reveal ---------- */
+(function(){
+  const io=new IntersectionObserver((es)=>{
+    es.forEach(e=>{if(e.isIntersecting){e.target.classList.add('in');io.unobserve(e.target);}});
+  },{threshold:.15});
+  document.querySelectorAll('.reveal').forEach(el=>io.observe(el));
+  // hero items in immediately
+  setTimeout(()=>document.querySelectorAll('header .reveal').forEach(el=>el.classList.add('in')),60);
+})();
+</script>
+</body>
+</html>
