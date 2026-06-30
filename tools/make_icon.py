@@ -160,8 +160,12 @@ def main() -> None:
     QGuiApplication([])
     ASSETS.mkdir(exist_ok=True)
     render(256).save(str(ASSETS / "icon.png"), "PNG")
+    render(1024).save(str(ASSETS / "icon@1024.png"), "PNG")
+    render(2048).save(str(ASSETS / "icon@2048.png"), "PNG")
     write_ico(ASSETS / "icon.ico", [16, 32, 48, 64, 128, 256])
     print(f"wrote {ASSETS / 'icon.png'}")
+    print(f"wrote {ASSETS / 'icon@1024.png'}")
+    print(f"wrote {ASSETS / 'icon@2048.png'}")
     print(f"wrote {ASSETS / 'icon.ico'}")
 
 
