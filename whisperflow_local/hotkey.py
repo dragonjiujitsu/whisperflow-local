@@ -1,8 +1,9 @@
 """Global toggle hotkey via pynput.
 
-Default chord is ``<ctrl>+<alt>+<space>`` (PLAN.md: chosen to dodge Win-key
-reserved combos + virtual-desktop shortcuts). Each activation invokes the
-supplied callback; the caller owns the IDLE/RECORDING/PROCESSING state machine.
+Default chord is ``<ctrl>+<cmd>`` (Ctrl+Win — Wispr Flow's Windows default; a
+modifier pair with no built-in OS action, so no reserved-combo collision). Each
+activation invokes the supplied callback; the caller owns the
+IDLE/RECORDING/PROCESSING state machine.
 """
 from __future__ import annotations
 

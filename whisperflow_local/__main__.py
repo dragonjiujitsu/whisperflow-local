@@ -124,23 +124,6 @@ def doctor() -> int:
     except Exception as exc:
         checks.append(("hotkey+overlay", False, str(exc)))
 
-    # reserved Win+<letter> freed? (only relevant for <cmd>+letter combos)
-    try:
-        from . import winhotkey
-
-        letter = winhotkey.win_letter(cfg.hotkey_combo)
-        if letter is None:
-            checks.append(("hotkey-reserved", True, f"{cfg.hotkey_combo} not a Win+letter combo"))
-        else:
-            freed = winhotkey.is_disabled(letter)
-            checks.append((
-                "hotkey-reserved",
-                freed,
-                f"Win+{letter} {'freed' if freed else 'NOT freed — run `run` once to apply'}",
-            ))
-    except Exception as exc:
-        checks.append(("hotkey-reserved", False, str(exc)))
-
     print("--- doctor ---")
     ok_all = True
     for name, ok, detail in checks:
@@ -279,16 +262,6 @@ def run() -> int:
     from .hotkey import HotkeyListener
 
     cfg = load_config()
-
-    # free a reserved Win+<letter> combo (e.g. Win+F) before binding the hotkey;
-    # no-op unless the combo is Win+letter and not already freed.
-    from . import winhotkey
-
-    changed, msg = winhotkey.ensure_freed(cfg.hotkey_combo)
-    print(f"[run] hotkey: {msg}")
-    if changed:
-        print("[run] Explorer was restarted to apply the hotkey change.")
-
     qapp = QApplication.instance() or QApplication(sys.argv)
     ctrl = Controller(cfg)
     print("[run] warming up models...")

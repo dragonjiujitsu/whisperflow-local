@@ -1,9 +1,9 @@
 # whisperflow-local configuration. All runtime knobs live here.
 
 hotkey:
-  combo: "<cmd>+f"                # Win+F. Reserved by Feedback Hub — freed at the
-                                  # Explorer level via DisabledHotkeys (see winhotkey.py).
-                                  # Auto-applied on `run`; reported by `doctor`.
+  combo: "<ctrl>+<cmd>"          # Ctrl+Win — Wispr Flow's Windows default. Modifier
+                                  # pair with no built-in OS action: zero collision,
+                                  # no reserved-combo fight, no registry hacks.
 
 audio:
   sample_rate: 16000              # faster-whisper expects 16kHz mono
