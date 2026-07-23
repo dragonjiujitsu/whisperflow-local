@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from whisperflow_local.platform.macos.accessibility import (
     AccessibilityTarget,
@@ -15,6 +16,7 @@ class FakeAPI:
     kAXFocusedWindowAttribute = "window"
     kAXRoleAttribute = "role"
     kAXIdentifierAttribute = "identifier"
+    kAXValueAttribute = "value"
 
     def __init__(self, trusted: bool = True) -> None:
         self.is_trusted = trusted
@@ -22,6 +24,7 @@ class FakeAPI:
         self.app = object()
         self.element = object()
         self.window = object()
+        self.value = "before"
 
     def AXIsProcessTrusted(self):
         return self.is_trusted
@@ -36,6 +39,7 @@ class FakeAPI:
             (self.app, "window"): self.window,
             (self.element, "role"): "AXTextArea",
             (self.element, "identifier"): "composer",
+            (self.element, "value"): self.value,
         }
         value = values.get((source, attribute))
         return (0, value) if value is not None else (-1, None)
@@ -85,6 +89,33 @@ class AccessibilityTests(unittest.TestCase):
         api = FakeAPI(trusted=False)
         target = MacAccessibility(api, FakeCF).capture()
         self.assertFalse(target.native)
+
+    @patch(
+        "whisperflow_local.platform.macos.accessibility._fallback_frontmost_pid",
+        return_value=42,
+    )
+    def test_untrusted_capture_never_matches_by_pid_alone(self, _fallback) -> None:
+        api = FakeAPI(trusted=False)
+        adapter = MacAccessibility(api, FakeCF)
+        self.assertFalse(adapter.matches(adapter.capture()))
+
+    @patch(
+        "whisperflow_local.platform.macos.accessibility._fallback_frontmost_pid",
+        return_value=42,
+    )
+    def test_revoked_accessibility_fails_closed(self, _fallback) -> None:
+        api = FakeAPI()
+        adapter = MacAccessibility(api, FakeCF)
+        target = adapter.capture()
+        api.is_trusted = False
+        self.assertFalse(adapter.matches(target))
+
+    def test_reads_value_only_from_native_target(self) -> None:
+        api = FakeAPI()
+        adapter = MacAccessibility(api, FakeCF)
+        target = adapter.capture()
+        self.assertEqual(adapter.value(target), "before")
+        self.assertIsNone(adapter.value(AccessibilityTarget(pid=42)))
 
     def test_target_does_not_store_field_contents(self) -> None:
         fields = set(AccessibilityTarget.__dataclass_fields__)

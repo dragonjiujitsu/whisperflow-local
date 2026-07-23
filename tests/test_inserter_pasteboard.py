@@ -41,11 +41,24 @@ class FakePasteboard:
         return True
 
 
+class FakeAccessibility:
+    def __init__(self, values, matches=None) -> None:
+        self.values = iter(values)
+        self.matches_results = iter(matches or [True] * 20)
+
+    def value(self, target):
+        return next(self.values)
+
+    def matches(self, target):
+        return next(self.matches_results)
+
+
 class InserterPasteboardTests(unittest.TestCase):
-    def make_inserter(self, pasteboard: FakePasteboard) -> Inserter:
+    def make_inserter(self, pasteboard: FakePasteboard, values=("", "dictated text")) -> Inserter:
         inserter = Inserter(
             {"mode": "paste", "settle_delay_s": 0, "press_enter_after": False},
             pasteboard=pasteboard,
+            accessibility=FakeAccessibility(values),
         )
         inserter._kb = FakeKeyboard()
         return inserter
@@ -68,6 +81,30 @@ class InserterPasteboardTests(unittest.TestCase):
         self.assertTrue(reason.startswith("pasteboard_unavailable:"))
         self.assertEqual(inserter._kb.actions, [])
         self.assertIsNone(pasteboard.restored)
+
+    def test_unconfirmed_paste_restores_prior_clipboard(self) -> None:
+        pasteboard = FakePasteboard()
+        inserter = self.make_inserter(pasteboard, values=(None, None))
+        inserter._confirmation_timeout = 0
+        ok, reason = inserter._paste("dictated text")
+        self.assertFalse(ok)
+        self.assertEqual(reason, "paste_unconfirmed")
+        self.assertEqual(pasteboard.text, "dictated text")
+        self.assertEqual(pasteboard.restored, (pasteboard.snapshot_value, 4))
+
+    def test_changed_target_during_confirmation_fails_closed(self) -> None:
+        pasteboard = FakePasteboard()
+        accessibility = FakeAccessibility(("",), matches=[False])
+        inserter = Inserter(
+            {"mode": "paste", "settle_delay_s": 0},
+            pasteboard=pasteboard,
+            accessibility=accessibility,
+        )
+        inserter._kb = FakeKeyboard()
+        ok, reason = inserter._paste("dictated text", target=object())
+        self.assertFalse(ok)
+        self.assertEqual(reason, "focus_changed_during_paste")
+        self.assertEqual(pasteboard.restored, (pasteboard.snapshot_value, 4))
 
 
 if __name__ == "__main__":

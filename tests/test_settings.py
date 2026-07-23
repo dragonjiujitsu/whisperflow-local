@@ -23,6 +23,13 @@ class SettingsTests(unittest.TestCase):
             settings = self.make_store(temp).load()
             self.assertEqual(settings["hotkey"]["combo"], "<cmd>+<shift>+<space>")
             self.assertEqual(settings["audio"]["sample_rate"], 16000)
+            self.assertEqual(settings["insert"]["confirmation_timeout_s"], 0.75)
+            self.assertNotIn("settle_delay_s", settings["insert"])
+            for obsolete in (
+                "fallback_provider", "api_key", "api_key_env",
+                "api_key_keychain_account",
+            ):
+                self.assertNotIn(obsolete, settings["cleanup"])
 
     def test_user_overrides_deep_merge_without_losing_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -58,6 +65,41 @@ class SettingsTests(unittest.TestCase):
             with self.assertRaisesRegex(SettingsError, "audio.max_seconds"):
                 store.save_overrides({"audio": {"max_seconds": 0}})
             self.assertFalse(store.paths.settings.exists())
+
+    def test_remote_cleanup_endpoint_is_rejected_before_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            store = self.make_store(temp)
+            with self.assertRaisesRegex(SettingsError, "loopback"):
+                store.save_overrides({
+                    "cleanup": {"base_url": "http://example.com:8888/v1"}
+                })
+            self.assertFalse(store.paths.settings.exists())
+
+    def test_optional_paste_confirmation_timeout_is_validated(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            store = self.make_store(temp)
+            store.save_overrides({"insert": {"confirmation_timeout_s": 0.75}})
+            self.assertEqual(
+                store.load()["insert"]["confirmation_timeout_s"], 0.75
+            )
+            with self.assertRaisesRegex(
+                SettingsError, "insert.confirmation_timeout_s"
+            ):
+                store.save_overrides(
+                    {"insert": {"confirmation_timeout_s": -0.01}}
+                )
+
+    def test_legacy_settle_delay_remains_valid(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            store = self.make_store(temp)
+            settings = store.load()
+            settings["insert"].pop("confirmation_timeout_s")
+            settings["insert"]["settle_delay_s"] = 0.15
+            SettingsStore.validate(settings)
+            store.save_overrides({"insert": {"settle_delay_s": 0.2}})
+            loaded = store.load()
+            self.assertEqual(loaded["insert"]["settle_delay_s"], 0.2)
+            self.assertNotIn("confirmation_timeout_s", loaded["insert"])
 
     def test_unknown_schema_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

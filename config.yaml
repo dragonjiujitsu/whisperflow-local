@@ -23,14 +23,10 @@ performance:
   streaming_gate_passed: false
 
 cleanup:
-  # Preferred runtime is Unsloth Studio's persistent OpenAI-compatible server.
-  # If it is not running, cleanup falls back to direct Unsloth CLI inference.
-  provider: "openai-compatible"   # openai-compatible | unsloth-cli | omlx | ollama
-  fallback_provider: "unsloth-cli"
+  # Runtime is an app-owned Unsloth Studio OpenAI-compatible loopback server.
+  # Its generated credential is injected in memory by the lifecycle manager.
+  provider: "openai-compatible"   # openai-compatible | omlx | ollama
   base_url: "http://localhost:8888/v1"
-  api_key_env: "UNSLOTH_API_KEY"
-  api_key: ""                     # do not commit sk-unsloth-* keys
-  api_key_keychain_account: "cleanup-api-key"
   model: "default"                # Unsloth Studio serves the loaded model as default
   model_path: "/Users/shawnvanbrunt/.cache/huggingface/hub/models--unsloth--Qwen3.5-4B-MTP-GGUF/snapshots/86835bf9949e4d14d6860f7910b1340ad4f271a9/Qwen3.5-4B-UD-Q4_K_XL.gguf"
   server_model: "unsloth/Qwen3.5-4B-MTP-GGUF"
@@ -53,7 +49,7 @@ cleanup:
 
 insert:
   mode: "paste"                   # paste | type
-  settle_delay_s: 0.15             # wait before restoring clipboard after Cmd+V
+  confirmation_timeout_s: 0.75     # bounded AX confirmation after Cmd+V
   press_enter_after: false         # do NOT auto-submit; user reviews then sends
 
 overlay:

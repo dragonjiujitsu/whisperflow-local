@@ -59,12 +59,19 @@ class MacAccessibility:
         if target.pid is None or current.pid != target.pid:
             return False
         if not target.native or not current.native:
-            return current.pid == target.pid
+            return False
         if not self._equal(target.element, current.element):
             return False
         if target.window is not None or current.window is not None:
             return self._equal(target.window, current.window)
         return True
+
+    def value(self, target: AccessibilityTarget) -> str | None:
+        """Read a focused field value transiently for paste confirmation."""
+        if not target.native or target.element is None or not self.trusted():
+            return None
+        value = self._copy(target.element, self._api.kAXValueAttribute)
+        return value if isinstance(value, str) else None
 
     def _copy(self, element, attribute):
         try:

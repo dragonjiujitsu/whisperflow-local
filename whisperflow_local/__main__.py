@@ -2,10 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
-import getpass
 import os
-import shutil
-import shlex
 import subprocess
 import sys
 import threading
@@ -28,6 +25,165 @@ SAMPLE_TEXT = (
     "um so like I was thinking you know maybe we could uh ship the the feature "
     "tomorrow morning if that works for everyone"
 )
+
+
+def _permission_health(report) -> tuple[str, str]:
+    if report.ready:
+        return "ready", "Cmd+Shift+Space to dictate"
+    missing = []
+    if report.microphone.value != "authorized":
+        missing.append("Microphone")
+    if report.accessibility.value != "authorized":
+        missing.append("Accessibility")
+    return "blocked", f"Grant {' and '.join(missing)} permission to dictate"
+
+
+class _PermissionGate:
+    """Activate the global listener only after both required TCC grants exist."""
+
+    def __init__(self, listener, on_revoked=None) -> None:
+        self._listener = listener
+        self._on_revoked = on_revoked
+        self._started = False
+        self._was_ready = False
+        self._lock = threading.Lock()
+
+    def refresh(self, report) -> bool:
+        revoked = False
+        with self._lock:
+            if not report.ready:
+                revoked = self._was_ready
+                self._was_ready = False
+                if self._listener is not None and self._started:
+                    self._listener.stop()
+                    self._started = False
+            else:
+                if self._listener is not None and not self._started:
+                    self._listener.start()
+                    self._started = True
+                self._was_ready = True
+        if revoked and self._on_revoked is not None:
+            self._on_revoked()
+        return report.ready
+
+    def stop(self) -> None:
+        with self._lock:
+            if self._listener is not None and self._started:
+                self._listener.stop()
+                self._started = False
+
+
+class _EscapeKeyListener:
+    """Global Escape cancellation, activated behind the permission gate."""
+
+    def __init__(self, on_escape) -> None:
+        self._on_escape = on_escape
+        self._listener = None
+
+    def start(self) -> None:
+        if self._listener is not None:
+            return
+        from pynput import keyboard
+
+        self._listener = keyboard.Listener(
+            on_press=lambda key: (
+                self._on_escape() if key == keyboard.Key.esc else None
+            )
+        )
+        self._listener.start()
+
+    def stop(self) -> None:
+        if self._listener is not None:
+            self._listener.stop()
+            self._listener = None
+
+
+class _ListenerGroup:
+    def __init__(self, *listeners) -> None:
+        self._listeners = listeners
+
+    def start(self) -> None:
+        started = []
+        for listener in self._listeners:
+            try:
+                listener.start()
+            except Exception:
+                listener.stop()
+                for active in reversed(started):
+                    active.stop()
+                raise
+            started.append(listener)
+
+    def stop(self) -> None:
+        for listener in reversed(self._listeners):
+            listener.stop()
+
+
+class _WarmupFlight:
+    """Run at most one initial/wake warmup flight at a time."""
+
+    def __init__(self, target) -> None:
+        self._target = target
+        self._lock = threading.Lock()
+        self._active = False
+        self._thread: threading.Thread | None = None
+
+    def start(self, name: str) -> bool:
+        with self._lock:
+            if self._active:
+                return False
+            self._active = True
+            self._thread = threading.Thread(
+                target=self._run, name=name, daemon=True
+            )
+            self._thread.start()
+            return True
+
+    def _run(self) -> None:
+        try:
+            self._target()
+        finally:
+            with self._lock:
+                self._active = False
+
+    def wait(self, timeout: float | None = None) -> bool:
+        with self._lock:
+            thread = self._thread
+        if thread is None:
+            return True
+        thread.join(timeout)
+        return not thread.is_alive()
+
+
+def _warm_runtime(ctrl, service_manager, service_state) -> tuple[str, str]:
+    final_state = "ready"
+    final_detail = "Cmd+Shift+Space to dictate"
+    if service_manager is not None:
+        try:
+            health = service_manager.connect_or_start()
+            service_state["value"] = health.state.value
+            print(f"[run] cleanup service {health.state.value}: {health.detail}")
+            if (
+                health.state.value == "ready"
+                and health.owned
+                and health.api_key
+            ):
+                ctrl.cleaner.set_api_key(health.api_key)
+            elif health.state.value == "ready":
+                final_state = "error"
+                final_detail = "cleanup service ownership could not be verified"
+            else:
+                final_state = "degraded"
+                final_detail = "cleanup unavailable; raw text will be recovered"
+        except Exception as exc:
+            service_state["value"] = "error"
+            final_state = "error"
+            final_detail = f"cleanup startup failed: {type(exc).__name__}"
+    try:
+        ctrl.warmup()
+    except Exception as exc:
+        return "error", f"model warmup failed: {type(exc).__name__}"
+    return final_state, final_detail
 
 
 # --------------------------------------------------------------------------- #
@@ -80,6 +236,51 @@ def _ensure_sample_macos() -> bool:
 # --------------------------------------------------------------------------- #
 # doctor
 # --------------------------------------------------------------------------- #
+def _cleanup_doctor_checks(cleanup: dict) -> list[tuple[str, bool, str]]:
+    provider = str(cleanup.get("provider", "ollama")).lower()
+    want = str(cleanup["model"])
+    if provider == "unsloth-cli":
+        return [(
+            "unsloth-cli",
+            False,
+            "disabled because the CLI exposes prompt data in process arguments",
+        )]
+    if provider == "ollama":
+        try:
+            from .cleanup import validate_ollama_host
+
+            host = validate_ollama_host(os.environ.get("OLLAMA_HOST", ""))
+            return [(
+                "ollama",
+                True,
+                f"loopback configured at {host}; model {want}; runtime not probed",
+            )]
+        except Exception as exc:
+            return [("ollama", False, str(exc))]
+    if provider in {"openai-compatible", "omlx"}:
+        try:
+            from .local_endpoint import validate_loopback_http_url
+            from .model_manager import ModelManager, ModelState
+
+            base_url = validate_loopback_http_url(
+                str(cleanup.get("base_url", "http://localhost:8888/v1"))
+            )
+            model = ModelManager().resolve_gguf(
+                str(cleanup.get("server_model") or ""),
+                str(cleanup.get("server_gguf_variant") or ""),
+                str(cleanup.get("model_path") or ""),
+            )
+            present = model.state is ModelState.READY
+            detail = (
+                f"app-owned endpoint configured at {base_url}; "
+                f"local model {model.state.value}"
+            )
+            return [(provider, present, detail)]
+        except Exception as exc:
+            return [(provider, False, str(exc))]
+    return [("cleanup-provider", False, f"unsupported provider {provider!r}")]
+
+
 def doctor() -> int:
     cfg = load_config()
     checks: list[tuple[str, bool, str]] = []
@@ -120,82 +321,7 @@ def doctor() -> int:
         f"package {'installed' if installed else 'MISSING'}; platform={sys.platform}",
     ))
 
-    # cleanup provider + model present
-    provider = str(cfg.cleanup.get("provider", "ollama")).lower()
-    want = cfg.cleanup["model"]
-    fallback_provider = str(cfg.cleanup.get("fallback_provider", "")).lower()
-    model_path = Path(str(cfg.cleanup.get("model_path") or want)).expanduser()
-
-    if provider == "unsloth-cli":
-        checks.append((
-            "unsloth-cli",
-            shutil.which("unsloth") is not None and model_path.exists(),
-            f"cli {'found' if shutil.which('unsloth') else 'MISSING'}; model {model_path}",
-        ))
-    elif provider == "ollama":
-        try:
-            import os
-
-            import ollama
-
-            host = os.environ.get("OLLAMA_HOST", "127.0.0.1")
-            loopback = ("127.0.0.1" in host) or ("localhost" in host) or host in ("", "127.0.0.1")
-            client = ollama.Client()
-            names = [m.model for m in client.list().models]
-            present = any(want in n for n in names)
-            checks.append(("ollama", present, f"model {want} {'present' if present else 'MISSING'}"))
-            if not loopback:
-                checks.append(("ollama-loopback", False, f"OLLAMA_HOST={host} not loopback"))
-        except Exception as exc:
-            checks.append(("ollama", False, str(exc)))
-    elif provider in {"openai-compatible", "omlx"}:
-        try:
-            import json
-            import os
-            from urllib import request
-
-            base_url = str(cfg.cleanup.get("base_url", "http://localhost:8888/v1")).rstrip("/")
-            env_name = str(cfg.cleanup.get("api_key_env", "")).strip()
-            api_key = os.environ.get(env_name, "").strip() if env_name else ""
-            api_key = api_key or str(cfg.cleanup.get("api_key", "")).strip()
-            if not api_key:
-                from .keychain import CLEANUP_API_KEY_ACCOUNT, KeychainSecretStore
-
-                account = str(
-                    cfg.cleanup.get("api_key_keychain_account")
-                    or CLEANUP_API_KEY_ACCOUNT
-                )
-                api_key = KeychainSecretStore().get(account).strip()
-            if not api_key:
-                raise RuntimeError(f"missing API key; set cleanup.api_key or ${env_name}")
-            req = request.Request(
-                f"{base_url}/models",
-                headers={"Authorization": f"Bearer {api_key}"},
-                method="GET",
-            )
-            with request.urlopen(req, timeout=5.0) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
-            models = body.get("data") or body.get("models") or []
-            names = [str(m.get("id") or m.get("name") or m) for m in models]
-            present = (want == "default" and bool(names)) or any(want == n or want in n for n in names)
-            detail = f"model {want} {'present' if present else 'MISSING'} at {base_url}"
-            if want == "default" and names:
-                detail = f"default -> {names[0]} at {base_url}"
-            if not names:
-                detail = f"no models reported at {base_url}"
-            checks.append((provider, present, detail))
-        except Exception as exc:
-            if fallback_provider == "unsloth-cli":
-                fallback_ok = shutil.which("unsloth") is not None and model_path.exists()
-                detail = (
-                    f"DEGRADED: server unavailable ({exc}); direct local fallback "
-                    f"{'available' if fallback_ok else 'MISSING'}"
-                )
-                checks.append((provider, fallback_ok, detail))
-            else:
-                checks.append((provider, False, str(exc)))
-    else:
-        checks.append(("cleanup-provider", False, f"unsupported provider {provider!r}"))
+    checks.extend(_cleanup_doctor_checks(cfg.cleanup))
 
     # clipboard
     try:
@@ -237,6 +363,19 @@ def doctor() -> int:
 # --------------------------------------------------------------------------- #
 # selftest: full pipeline on a spoken sample, paste into a real focused field
 # --------------------------------------------------------------------------- #
+def _run_owned_cleanup_selftest(cleaner, transcript: str, service_manager) -> str:
+    """Clean self-test text only through a READY child owned by this process."""
+    health = service_manager.connect_or_start()
+    if (
+        health.state.value != "ready"
+        or not health.owned
+        or not health.api_key
+    ):
+        raise RuntimeError("selftest cleanup requires a READY app-owned service")
+    cleaner.set_api_key(health.api_key)
+    return cleaner.clean(transcript)
+
+
 def selftest() -> int:
     cfg = load_config()
     results: dict[str, bool] = {}
@@ -248,18 +387,50 @@ def selftest() -> int:
     audio, sr = load_wav_16k_mono(SAMPLE)
 
     # STT
+    from .app import _resolved_stt_config
     from .stt import Transcriber
 
-    stt = Transcriber(cfg.stt)
+    stt = Transcriber(_resolved_stt_config(cfg))
     transcript = stt.transcribe(audio, sr)
     print(f"[stt] {transcript!r}")
     results["2_stt_nonempty"] = bool(transcript.strip())
 
-    # cleanup
+    # Managed OpenAI-compatible cleanup must only use a child started and
+    # authenticated by this process. Ollama is supported separately because
+    # Cleaner pins its client to a validated HTTP loopback endpoint.
     from .cleanup import Cleaner
 
+    provider = str(cfg.cleanup.get("provider", "")).lower()
+    if provider not in {"ollama", "openai-compatible", "omlx"}:
+        print("[cleanup] selftest cleanup provider is unsupported")
+        results["3_cleanup_nonempty"] = False
+        results["3b_filler_reduced"] = False
+        return _report(results)
+
     cleaner = Cleaner(cfg.cleanup)
-    cleaned = cleaner.clean(transcript)
+    if provider == "ollama":
+        try:
+            cleaned = cleaner.clean(transcript)
+        except Exception as exc:
+            print(f"[cleanup] unavailable: {type(exc).__name__}")
+            results["3_cleanup_nonempty"] = False
+            results["3b_filler_reduced"] = False
+            return _report(results)
+    else:
+        from .service import LocalServiceManager
+
+        service_manager = LocalServiceManager(cfg.cleanup)
+        try:
+            cleaned = _run_owned_cleanup_selftest(
+                cleaner, transcript, service_manager
+            )
+        except Exception as exc:
+            print(f"[cleanup] unavailable: {type(exc).__name__}")
+            results["3_cleanup_nonempty"] = False
+            results["3b_filler_reduced"] = False
+            return _report(results)
+        finally:
+            service_manager.stop()
     print(f"[cleanup] {cleaned!r}")
     results["3_cleanup_nonempty"] = bool(cleaned.strip())
     # Cleanup should drop at least one filler/disfluency token.
@@ -432,15 +603,26 @@ def run() -> int:
         service_manager = LocalServiceManager(cfg.cleanup)
     listener = None
     if not smoke_exit_ms:
-        listener = HotkeyListener(cfg.hotkey_combo, ctrl.on_hotkey)
-        listener.start()
+        listener = _ListenerGroup(
+            HotkeyListener(cfg.hotkey_combo, ctrl.on_hotkey),
+            _EscapeKeyListener(ctrl.cancel_requested.emit),
+        )
 
     permissions = MacPermissions()
+    permission_gate = _PermissionGate(
+        listener,
+        on_revoked=lambda: ctrl.on_system_event("permissions_revoked"),
+    )
     model_manager = ModelManager()
     onboarding = OnboardingWindow(permissions)
     settings_window = SettingsWindow(REPO / "config.yaml")
     recovery_window = RecoveryWindow(ctrl.recovery, ctrl.history)
     service_state = {"value": "starting" if service_manager else "fallback"}
+    warmup_state = {
+        "complete": False,
+        "state": "warming",
+        "detail": "warming local models",
+    }
 
     def show_window(window) -> None:
         window.show()
@@ -475,32 +657,59 @@ def run() -> int:
     ctrl.health_signal.connect(
         lambda state, detail: update_tray_status(tray, state, detail)
     )
-    if not permissions.report().ready:
+    initial_permissions = permissions.report()
+    permission_gate.refresh(initial_permissions)
+    if not initial_permissions.ready:
         onboarding.show()
+        ctrl.health_signal.emit(*_permission_health(initial_permissions))
+
+    last_runtime_health = {"value": None}
+
+    def publish_runtime_health(report=None) -> bool:
+        report = report or permissions.report()
+        if not permission_gate.refresh(report):
+            health = _permission_health(report)
+        elif warmup_state["complete"]:
+            health = (
+                str(warmup_state["state"]), str(warmup_state["detail"])
+            )
+        else:
+            return True
+        if health != last_runtime_health["value"]:
+            last_runtime_health["value"] = health
+            ctrl.health_signal.emit(*health)
+        return report.ready
+
+    def refresh_permissions() -> None:
+        report = permissions.report()
+        if publish_runtime_health(report) and onboarding.isVisible():
+            onboarding.hide()
+
+    permission_refresh_timer = QTimer(qapp)
+    permission_refresh_timer.setInterval(1000)
+    permission_refresh_timer.timeout.connect(refresh_permissions)
+    permission_refresh_timer.start()
 
     def warmup() -> None:
-        final_state = "ready"
-        final_detail = "Cmd+Shift+Space to dictate"
+        warmup_state["complete"] = False
         if service_manager is not None:
             print("[run] connecting to local cleanup service...")
-            health = service_manager.connect_or_start()
-            service_state["value"] = health.state.value
-            ctrl.health_signal.emit(health.state.value, health.detail)
-            print(f"[run] cleanup service {health.state.value}: {health.detail}")
-            if health.api_key:
-                ctrl.cleaner.set_api_key(health.api_key)
-            if health.state.value != "ready":
-                final_state = "degraded"
-                final_detail = "using direct local cleanup fallback"
         print("[run] warming local models in the background...")
-        ctrl.warmup()
-        ctrl.health_signal.emit(final_state, final_detail)
-        print("[run] local models ready.")
+        final_state, final_detail = _warm_runtime(
+            ctrl, service_manager, service_state
+        )
+        warmup_state.update(
+            complete=True, state=final_state, detail=final_detail
+        )
+        publish_runtime_health()
+        print(f"[run] warmup {final_state}: {final_detail}")
+
+    warmup_flight = _WarmupFlight(warmup)
 
     def power_event(event: str) -> None:
         ctrl.on_system_event(event)
         if event == "wake" and not smoke_exit_ms:
-            threading.Thread(target=warmup, name="wake-warmup", daemon=True).start()
+            warmup_flight.start("wake-warmup")
 
     power_monitor = MacPowerMonitor(power_event)
     power_monitor.start()
@@ -509,16 +718,15 @@ def run() -> int:
         update_tray_status(tray, "smoke", "bundle imports and shell initialized")
         QTimer.singleShot(smoke_exit_ms, qapp.quit)
     else:
-        threading.Thread(target=warmup, name="model-warmup", daemon=True).start()
+        warmup_flight.start("model-warmup")
     print(
-        f"[run] app ready. Toggle with {cfg.hotkey_combo}. "
+        f"[run] app launched. Toggle with {cfg.hotkey_combo} when ready. "
         "Models continue warming in the background; quit via tray or Ctrl+C."
     )
     try:
         return qapp.exec()
     finally:
-        if listener is not None:
-            listener.stop()
+        permission_gate.stop()
         power_monitor.stop()
         tray.hide()
         if service_manager is not None:
@@ -544,32 +752,6 @@ def uninstall_autostart() -> int:
     return 0
 
 
-def cleanup_server_command() -> int:
-    from .service import build_unsloth_command
-
-    cmd = build_unsloth_command(load_config().cleanup)
-
-    print("Start the cleanup server in another terminal:")
-    print("  " + " ".join(shlex.quote(part) for part in cmd))
-    print()
-    print("The app normally starts this service and stores its generated key in Keychain.")
-    print("For manual service use, store the printed key with:")
-    print("  python -m whisperflow_local set-cleanup-key")
-    return 0
-
-
-def set_cleanup_key() -> int:
-    from .keychain import CLEANUP_API_KEY_ACCOUNT, KeychainSecretStore
-
-    secret = getpass.getpass("Local cleanup server API key: ").strip()
-    if not secret:
-        print("[keychain] no key entered; nothing changed")
-        return 1
-    KeychainSecretStore().set(CLEANUP_API_KEY_ACCOUNT, secret)
-    print("[keychain] cleanup server key stored for this macOS user")
-    return 0
-
-
 def delete_cleanup_key() -> int:
     from .keychain import CLEANUP_API_KEY_ACCOUNT, KeychainSecretStore
 
@@ -592,16 +774,12 @@ def main() -> int:
         return install_autostart()
     if cmd == "uninstall-autostart":
         return uninstall_autostart()
-    if cmd == "cleanup-server-command":
-        return cleanup_server_command()
-    if cmd == "set-cleanup-key":
-        return set_cleanup_key()
     if cmd == "delete-cleanup-key":
         return delete_cleanup_key()
     print(
         f"unknown command: {cmd}\nusage: python -m whisperflow_local "
-        "[doctor|run|selftest|cleanup-server-command|set-cleanup-key|"
-        "delete-cleanup-key|install-autostart|uninstall-autostart]"
+        "[doctor|run|selftest|delete-cleanup-key|"
+        "install-autostart|uninstall-autostart]"
     )
     return 2
 

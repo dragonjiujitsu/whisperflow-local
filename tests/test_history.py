@@ -26,6 +26,7 @@ class HistoryTests(unittest.TestCase):
             destination = Path(temp) / "export.json"
             store.export_to(destination)
             self.assertIn("current", destination.read_text())
+            self.assertEqual(destination.stat().st_mode & 0o777, 0o600)
             store.delete(current.entry_id)
             self.assertEqual(store.list(now=now), [])
             store.add("again", now=now)

@@ -10,6 +10,7 @@ from typing import Any
 
 import yaml
 
+from .local_endpoint import validate_loopback_http_url
 from .paths import AppPaths
 
 SETTINGS_VERSION = 1
@@ -43,6 +44,15 @@ class SettingsStore:
                 f"unsupported settings schema {version!r}; expected {SETTINGS_VERSION}"
             )
         merged = _deep_merge(defaults, raw)
+        insert_override = raw.get("insert")
+        if (
+            isinstance(insert_override, dict)
+            and "settle_delay_s" in insert_override
+            and "confirmation_timeout_s" not in insert_override
+        ):
+            # Preserve the legacy override instead of silently replacing it
+            # with the new bundled default during the deep merge.
+            _section(merged, "insert").pop("confirmation_timeout_s", None)
         self.validate(merged)
         return merged
 
@@ -101,13 +111,33 @@ class SettingsStore:
         provider = _string(value, "cleanup", "provider")
         if provider not in {"openai-compatible", "omlx", "unsloth-cli", "ollama"}:
             raise SettingsError(f"unsupported cleanup provider: {provider}")
+        if provider == "unsloth-cli":
+            raise SettingsError(
+                "unsupported cleanup provider: unsloth-cli has no private prompt input"
+            )
+        if provider in {"openai-compatible", "omlx"}:
+            try:
+                validate_loopback_http_url(_string(value, "cleanup", "base_url"))
+            except ValueError as exc:
+                raise SettingsError(str(exc)) from exc
         _string(value, "cleanup", "model")
         _string(value, "cleanup", "prompt")
         _number(value, "cleanup", "max_expansion_ratio", minimum=1, maximum=10)
         mode = _string(value, "insert", "mode")
         if mode not in {"paste", "type"}:
             raise SettingsError(f"unsupported insertion mode: {mode}")
-        _number(value, "insert", "settle_delay_s", minimum=0, maximum=10)
+        insert = _section(value, "insert")
+        timeout_keys = (
+            "confirmation_timeout_s",
+            "settle_delay_s",
+        )
+        if not any(key in insert for key in timeout_keys):
+            raise SettingsError(
+                "insert.confirmation_timeout_s must be configured"
+            )
+        for key in timeout_keys:
+            if key in insert:
+                _number(value, "insert", key, minimum=0, maximum=10)
         _boolean(value, "insert", "press_enter_after")
         _boolean(value, "overlay", "enabled")
         _boolean(value, "logging", "metadata_only")

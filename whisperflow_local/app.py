@@ -28,6 +28,7 @@ from .overlay import VoicePill
 from .evaluation import guarded_cleanup
 from .history import HistoryStore
 from .paths import AppPaths
+from .performance_profiles import resolve_profile
 from .profiles import resolve_writing_mode
 from .recovery import RecoveryStore
 from .session import SessionEvent, SessionPhase, SessionReducer
@@ -39,13 +40,25 @@ IDLE, RECORDING, PROCESSING = "IDLE", "RECORDING", "PROCESSING"
 # sized for up to a ~5 min dictation (batch STT + LLM cleanup both run at stop)
 STT_TIMEOUT_S = 90.0
 CLEANUP_TIMEOUT_S = 90.0
+_PRESERVE_CLIPBOARD_FAILURES = {
+    "focus_changed",
+    "focus_changed_during_paste",
+    "paste_unconfirmed",
+}
 
 
 @dataclass(frozen=True)
 class ProcessResult:
     ok: bool
     reason: str = ""
-    recovered_to_clipboard: bool = False
+    text: str = ""
+    target: object | None = None
+    recovery_text: str = ""
+    audio: object | None = None
+    started_at: float = 0.0
+    stt_finished_at: float = 0.0
+    cleanup_finished_at: float = 0.0
+    was_warm: bool = False
 
 
 def start_audio_session(recorder, play_start_cue) -> None:
@@ -68,7 +81,7 @@ class Controller(QObject):
     overflow_signal = Signal()  # audio callback -> main: hit max_seconds, finalize
     show_overlay = Signal()
     hide_overlay = Signal()
-    fail_signal = Signal(str)  # worker -> main: nothing inserted (empty/abort/error)
+    fail_signal = Signal(str)  # worker -> main: text was not safely inserted
     phase_signal = Signal(int, object)
     process_complete = Signal(int, object)
     health_signal = Signal(str, str)
@@ -115,7 +128,7 @@ class Controller(QObject):
         self.recorder = Recorder(
             cfg.audio, self.rms_q, on_overflow=self.overflow_signal.emit
         )
-        self.stt = Transcriber(cfg.stt)
+        self.stt = Transcriber(_resolved_stt_config(cfg))
         self.cleaner = Cleaner(cfg.cleanup)
         self.inserter = Inserter(cfg.insert)
         # Timed-out native/model work cannot be force-killed safely. Serializing
@@ -167,7 +180,8 @@ class Controller(QObject):
             self._start_recording()
         elif self.state == RECORDING:
             self._stop_and_process()
-        # PROCESSING: ignored (no reentrancy)
+        else:
+            self._on_cancel()
 
     def _on_overflow(self) -> None:
         """Hit max_seconds: finalize exactly like a manual stop (transcribe what
@@ -179,14 +193,16 @@ class Controller(QObject):
         self._stop_and_process()
 
     def _on_cancel(self) -> None:
-        """Esc during RECORDING: discard audio, no STT/cleanup/paste."""
-        if self.state != RECORDING:
+        """Cancel recording or processing before any later user-visible effect."""
+        current_state = self.state
+        if current_state == IDLE:
             return
         session = self.sessions.current
         self.sessions.transition(session.session_id, SessionEvent.CANCELLED)
         self._pump.stop()
         self.hide_overlay.emit()
-        self.recorder.stop()  # drop the buffer; nothing is processed
+        if current_state == RECORDING:
+            self.recorder.stop()  # drop the buffer; nothing is processed
         self._beep_cancel()
         self.log.info("state=IDLE (cancelled)")
 
@@ -245,18 +261,17 @@ class Controller(QObject):
     def _process(self, session_id, cancelled, audio, target) -> None:
         t0 = time.perf_counter()
         was_warm = self._warmup_complete
+        transcript = ""
         try:
             self.phase_signal.emit(session_id, SessionEvent.TRANSCRIPTION_STARTED)
             completed, transcript = _with_timeout(
-                lambda: _locked_call(
-                    self._stt_lock, self.stt.transcribe, audio, self._sr
-                ),
+                lambda: self.stt.transcribe(audio, self._sr),
                 STT_TIMEOUT_S,
                 "",
+                lock=self._stt_lock,
             )
             t_stt = time.perf_counter()
             if not completed:
-                cancelled.set()
                 self._record_metric(
                     session_id, audio, t0, t_stt, t_stt, t_stt,
                     "stt_timeout", was_warm,
@@ -293,63 +308,62 @@ class Controller(QObject):
             if self.vocabulary.terms:
                 vocabulary_instruction = " Preferred spellings: " + ", ".join(self.vocabulary.terms) + "."
             completed, cleaned = _with_timeout(
-                lambda: _locked_call(
-                    self._cleanup_lock, self.cleaner.clean, transcript, cancelled,
+                lambda: self.cleaner.clean(
+                    transcript,
+                    cancelled,
                     mode.instruction + vocabulary_instruction,
                 ),
                 CLEANUP_TIMEOUT_S,
                 transcript,
+                lock=self._cleanup_lock,
             )
             t_clean = time.perf_counter()
             if not completed:
-                cancelled.set()
-                stashed = self._stash_to_clipboard(transcript)
                 self._record_metric(
                     session_id, audio, t0, t_stt, t_clean, t_clean,
                     "cleanup_timeout", was_warm,
                 )
                 self.process_complete.emit(
-                    session_id, ProcessResult(False, "cleanup timed out", stashed)
+                    session_id,
+                    ProcessResult(
+                        False,
+                        "cleanup timed out",
+                        recovery_text=transcript,
+                    ),
                 )
                 return
             if cancelled.is_set():
                 return
-            cleaned = guarded_cleanup(transcript, cleaned)
-            self.history.add(cleaned)
+            cleaned = guarded_cleanup(
+                transcript,
+                cleaned,
+                protected_terms=self.vocabulary.terms,
+            )
+            if cancelled.is_set():
+                return
             self.phase_signal.emit(session_id, SessionEvent.CLEANUP_FINISHED)
-            ok, reason = self.inserter.insert(cleaned, target)
-            t_ins = time.perf_counter()
-            if not ok:
-                # don't lose the words: leave the cleaned text on the clipboard
-                # so the user can paste it manually (esp. on focus_changed)
-                stashed = self._stash_to_clipboard(cleaned)
-                detail = reason or "insert failed"
-                self.process_complete.emit(
-                    session_id, ProcessResult(False, detail, stashed)
-                )
-            else:
-                self.process_complete.emit(session_id, ProcessResult(True))
-            self._record_metric(
-                session_id, audio, t0, t_stt, t_clean, t_ins,
-                "inserted" if ok else (reason or "insert_failed"), was_warm,
-            )
-            audio_s = audio.size / self._sr
-            print(
-                f"[timing] audio={audio_s:.1f}s | stt={(t_stt-t0)*1000:.0f}ms "
-                f"| cleanup={(t_clean-t_stt)*1000:.0f}ms "
-                f"| insert={(t_ins-t_clean)*1000:.0f}ms "
-                f"| total={(t_ins-t0)*1000:.0f}ms | ok={ok}",
-                flush=True,
-            )
-            self.log.info(
-                "timing audio_s=%.1f stt_ms=%.0f cleanup_ms=%.0f insert_ms=%.0f total_ms=%.0f ok=%s",
-                audio_s, (t_stt-t0)*1000, (t_clean-t_stt)*1000,
-                (t_ins-t_clean)*1000, (t_ins-t0)*1000, ok,
+            self.process_complete.emit(
+                session_id,
+                ProcessResult(
+                    True,
+                    text=cleaned,
+                    target=target,
+                    audio=audio,
+                    started_at=t0,
+                    stt_finished_at=t_stt,
+                    cleanup_finished_at=t_clean,
+                    was_warm=was_warm,
+                ),
             )
         except Exception as exc:  # guarantee return to IDLE
             self.log.exception("process error: %s", type(exc).__name__)
             self.process_complete.emit(
-                session_id, ProcessResult(False, f"error: {type(exc).__name__}")
+                session_id,
+                ProcessResult(
+                    False,
+                    f"error: {type(exc).__name__}",
+                    recovery_text=transcript,
+                ),
             )
 
     def _record_metric(
@@ -379,14 +393,70 @@ class Controller(QObject):
             self.log.warning("ignored worker phase: %s", exc)
 
     def _on_process_complete(self, session_id: int, result: object) -> None:
-        if session_id != self.sessions.current.session_id:
-            self.log.info("ignored stale result session=%s", session_id)
+        if not self.sessions.is_active(session_id):
+            self.log.info("ignored stale or cancelled result session=%s", session_id)
             return
         if not isinstance(result, ProcessResult):
             self.sessions.fail(session_id, "invalid_worker_result")
             self._on_fail("invalid worker result")
             return
         if result.ok:
+            if not result.text or result.target is None:
+                self.sessions.fail(session_id, "invalid_worker_result")
+                self._on_fail("invalid worker result")
+                return
+            try:
+                ok, reason = self.inserter.insert(result.text, result.target)
+            except Exception as exc:
+                self.log.exception(
+                    "authorized completion failed: %s", type(exc).__name__
+                )
+                recovered = self._stash_to_clipboard(result.text)
+                try:
+                    self.history.add(result.text)
+                except Exception as history_exc:
+                    self.log.warning(
+                        "optional history write failed: %s",
+                        type(history_exc).__name__,
+                    )
+                self.sessions.fail(
+                    session_id, f"completion error: {type(exc).__name__}"
+                )
+                detail = f"completion error: {type(exc).__name__}"
+                if recovered:
+                    detail += " — text on clipboard"
+                self._on_fail(detail)
+                return
+            completed_at = time.perf_counter()
+            outcome = "inserted" if ok else (reason or "insert_failed")
+            try:
+                self._record_completed_result(
+                    session_id, result, completed_at, outcome, ok
+                )
+            except Exception as exc:
+                self.log.warning(
+                    "completion metric failed: %s", type(exc).__name__
+                )
+            try:
+                self.history.add(result.text)
+            except Exception as exc:
+                self.log.warning(
+                    "optional history write failed: %s", type(exc).__name__
+                )
+            if not ok:
+                preserve_clipboard = reason in _PRESERVE_CLIPBOARD_FAILURES
+                recovered = self._stash_to_clipboard(
+                    result.text,
+                    write_clipboard=not preserve_clipboard,
+                )
+                self.sessions.fail(session_id, reason or "insert failed")
+                detail = reason or "insert failed"
+                if preserve_clipboard:
+                    detail += " — text saved for recovery"
+                elif recovered:
+                    detail += " — text on clipboard"
+                self._on_fail(detail)
+                return
             try:
                 self.sessions.transition(session_id, SessionEvent.INSERTION_FINISHED)
             except ValueError as exc:
@@ -395,15 +465,62 @@ class Controller(QObject):
                 return
             self.log.info("state=READY")
             return
+        recovered = False
+        if result.recovery_text:
+            recovered = self._stash_to_clipboard(result.recovery_text)
         self.sessions.fail(session_id, result.reason)
         detail = result.reason
-        if result.recovered_to_clipboard:
+        if recovered:
             detail += " — text on clipboard"
         self._on_fail(detail)
 
-    def _stash_to_clipboard(self, text: str) -> bool:
+    def _record_completed_result(
+        self,
+        session_id: int,
+        result: ProcessResult,
+        completed_at: float,
+        outcome: str,
+        ok: bool,
+    ) -> None:
+        if result.audio is None:
+            return
+        self._record_metric(
+            session_id,
+            result.audio,
+            result.started_at,
+            result.stt_finished_at,
+            result.cleanup_finished_at,
+            completed_at,
+            outcome,
+            result.was_warm,
+        )
+        audio_s = result.audio.size / self._sr
+        print(
+            f"[timing] audio={audio_s:.1f}s "
+            f"| stt={(result.stt_finished_at-result.started_at)*1000:.0f}ms "
+            f"| cleanup={(result.cleanup_finished_at-result.stt_finished_at)*1000:.0f}ms "
+            f"| insert={(completed_at-result.cleanup_finished_at)*1000:.0f}ms "
+            f"| total={(completed_at-result.started_at)*1000:.0f}ms | ok={ok}",
+            flush=True,
+        )
+        self.log.info(
+            "timing audio_s=%.1f stt_ms=%.0f cleanup_ms=%.0f "
+            "insert_ms=%.0f total_ms=%.0f ok=%s",
+            audio_s,
+            (result.stt_finished_at-result.started_at)*1000,
+            (result.cleanup_finished_at-result.stt_finished_at)*1000,
+            (completed_at-result.cleanup_finished_at)*1000,
+            (completed_at-result.started_at)*1000,
+            ok,
+        )
+
+    def _stash_to_clipboard(
+        self, text: str, *, write_clipboard: bool = True
+    ) -> bool:
         """Best-effort: put uninserted text on the clipboard for manual paste."""
         self.recovery.add(text, "automatic insertion unavailable")
+        if not write_clipboard:
+            return False
         try:
             from . import clipboard
 
@@ -416,7 +533,7 @@ class Controller(QObject):
     # -- main-thread slot: surface a silent failure to the user ---------------
     def _on_fail(self, reason: str) -> None:
         self.log.info("fail reason=%s", reason)
-        print(f"[fail] {reason} — nothing inserted", flush=True)
+        print(f"[fail] {reason} — text not safely inserted", flush=True)
         self.pill.flash_error()
         self._beep_error()
 
@@ -471,35 +588,57 @@ class Controller(QObject):
         )
 
     def warmup(self) -> None:
-        with self._stt_lock:
-            self.stt.load()
+        self._warmup_complete = False
+        if not self._stt_lock.acquire(blocking=False):
+            raise RuntimeError("STT backend is still busy")
         try:
-            with self._cleanup_lock:
-                self.cleaner.warmup()
-        except Exception as exc:
-            self.log.warning("cleanup warmup failed: %s", exc)
+            self.stt.load()
         finally:
-            self._warmup_complete = True
+            self._stt_lock.release()
+        if not self._cleanup_lock.acquire(blocking=False):
+            raise RuntimeError("cleanup backend is still busy")
+        try:
+            self.cleaner.warmup()
+        finally:
+            self._cleanup_lock.release()
+        self._warmup_complete = True
 
 
-def _with_timeout(fn, timeout_s: float, fallback):
+def _with_timeout(
+    fn, timeout_s: float, fallback, *, lock: threading.Lock | None = None
+):
     """Run fn on a thread and report whether it completed before its deadline."""
+    if lock is not None and not lock.acquire(blocking=False):
+        return False, fallback
     result = {"value": fallback}
+    error: list[Exception] = []
 
     def runner():
-        result["value"] = fn()
+        try:
+            result["value"] = fn()
+        except Exception as exc:
+            error.append(exc)
+        finally:
+            if lock is not None:
+                lock.release()
 
     t = threading.Thread(target=runner, daemon=True)
     t.start()
     t.join(timeout_s)
     if t.is_alive():
         return False, fallback
+    if error:
+        raise error[0]
     return True, result["value"]
 
 
-def _locked_call(lock, fn, *args):
-    with lock:
-        return fn(*args)
+def _resolved_stt_config(cfg: Config) -> dict:
+    performance = cfg.performance
+    profile = resolve_profile(str(performance.get("profile", "instant")))
+    resolved = dict(cfg.stt)
+    resolved["model"] = profile.model
+    resolved["batch_size"] = profile.batch_size
+    return resolved
 
 
 def _peak_memory_mb() -> float:

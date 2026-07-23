@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import time
 import uuid
 from dataclasses import asdict, dataclass
@@ -55,13 +56,35 @@ class HistoryStore:
         self.path.unlink(missing_ok=True)
 
     def export_to(self, destination: Path) -> None:
-        destination.write_text(json.dumps([asdict(item) for item in self.list()], indent=2) + "\n")
+        self._write_private(
+            destination,
+            json.dumps([asdict(item) for item in self.list()], indent=2) + "\n",
+        )
 
     def _write(self, entries: list[HistoryEntry]) -> None:
         if not self.enabled:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        temp = self.path.with_suffix(".tmp")
-        temp.write_text(json.dumps({"schema_version": 1, "entries": [asdict(item) for item in entries]}))
-        os.chmod(temp, 0o600)
-        os.replace(temp, self.path)
+        self._write_private(
+            self.path,
+            json.dumps(
+                {"schema_version": 1, "entries": [asdict(item) for item in entries]}
+            ),
+        )
+
+    @staticmethod
+    def _write_private(destination: Path, content: str) -> None:
+        descriptor, temp_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+        )
+        temp = Path(temp_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temp, 0o600)
+            os.replace(temp, destination)
+            os.chmod(destination, 0o600)
+        finally:
+            temp.unlink(missing_ok=True)

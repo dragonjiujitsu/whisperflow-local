@@ -7,13 +7,17 @@ from whisperflow_local.platform.macos.pasteboard import PasteboardSnapshot
 
 
 class FakeAccessibility:
-    def __init__(self, matches: list[bool]) -> None:
+    def __init__(self, matches: list[bool], values: list[str | None]) -> None:
         self.results = iter(matches)
+        self.values = iter(values)
         self.calls = 0
 
     def matches(self, target) -> bool:
         self.calls += 1
         return next(self.results)
+
+    def value(self, target):
+        return next(self.values)
 
 
 class FakePasteboard:
@@ -48,9 +52,9 @@ class FakeKeyboard:
 
 
 class InserterFocusTests(unittest.TestCase):
-    def make_inserter(self, matches, press_enter=False):
+    def make_inserter(self, matches, values=(), press_enter=False):
         pasteboard = FakePasteboard()
-        accessibility = FakeAccessibility(matches)
+        accessibility = FakeAccessibility(matches, list(values))
         inserter = Inserter(
             {
                 "mode": "paste",
@@ -76,14 +80,14 @@ class InserterFocusTests(unittest.TestCase):
 
     def test_target_is_revalidated_before_optional_submit(self) -> None:
         inserter, pasteboard, accessibility, keyboard = self.make_inserter(
-            [True, False], press_enter=True
+            [True, True, False], ["", "hello"], press_enter=True
         )
         target = FocusTarget(pid=42, native=True, element=object())
         ok, reason = inserter.insert("hello", target)
         self.assertTrue(ok)
         self.assertEqual(reason, "pasted")
         self.assertEqual(pasteboard.writes, ["hello"])
-        self.assertEqual(accessibility.calls, 2)
+        self.assertEqual(accessibility.calls, 3)
         self.assertFalse(any(action[0] == "tap" for action in keyboard.actions))
 
 

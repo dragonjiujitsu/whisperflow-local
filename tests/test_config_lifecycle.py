@@ -33,16 +33,17 @@ class ConfigLifecycleTests(unittest.TestCase):
         config = load_config(ROOT / "config.yaml")
         self.assertEqual(config.stt["model"], "distil-large-v3")
 
-    def test_cleanup_key_falls_back_to_keychain(self) -> None:
+    def test_cleanup_key_waits_for_owned_runtime_injection(self) -> None:
         cleanup = dict(load_config(ROOT / "config.yaml").cleanup)
         cleanup["api_key"] = ""
         cleanup["api_key_env"] = "UNSET_TEST_KEY"
         with patch.dict("os.environ", {}, clear=True), patch(
             "whisperflow_local.keychain.KeychainSecretStore.get",
-            return_value="keychain-secret",
-        ):
+            side_effect=AssertionError("managed Cleaner must not read Keychain"),
+        ) as keychain_get:
             cleaner = Cleaner(cleanup)
-        self.assertEqual(cleaner._openai_api_key, "keychain-secret")
+        self.assertEqual(cleaner._openai_api_key, "")
+        keychain_get.assert_not_called()
 
     def test_logs_use_application_logs_not_repository(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

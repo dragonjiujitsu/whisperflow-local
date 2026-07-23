@@ -1,4 +1,4 @@
-"""Local transcript cleanup through Unsloth, Ollama, or an OpenAI-compatible server.
+"""Local transcript cleanup through Ollama or an OpenAI-compatible server.
 
 Transcript-only editing with an anti-injection guard: if the model output expands
 suspiciously beyond the input, we reject it and fall back to the raw transcript.
@@ -7,23 +7,53 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
-import subprocess
-import time
 from threading import Event
 from urllib.error import URLError
 from urllib import request
+from urllib.parse import urlsplit
 
 import ollama
+
+from .local_endpoint import open_local_request, validate_loopback_http_url
 
 
 class CleanupCancelled(RuntimeError):
     pass
 
 
+def validate_ollama_host(value: str) -> str:
+    """Normalize OLLAMA_HOST after enforcing a loopback-only HTTP endpoint."""
+    raw = str(value).strip()
+    if not raw:
+        raw = "127.0.0.1:11434"
+    if "://" not in raw:
+        raw = f"http://{raw}"
+
+    parts = urlsplit(raw)
+    if parts.path not in {"", "/"}:
+        raise ValueError("OLLAMA_HOST must not include a path")
+    try:
+        port = parts.port
+    except ValueError as exc:
+        raise ValueError("OLLAMA_HOST must include a valid port") from exc
+    if port is None:
+        host = parts.hostname or ""
+        authority_host = f"[{host}]" if ":" in host else host
+        raw = f"http://{authority_host}:11434"
+
+    try:
+        return validate_loopback_http_url(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "OLLAMA_HOST must be an HTTP loopback endpoint"
+        ) from exc
+
+
 class Cleaner:
     def __init__(self, cfg: dict, timeout_s: float = 120.0) -> None:
         self._provider = str(cfg.get("provider", "ollama")).lower()
+        if self._provider not in {"ollama", "openai-compatible", "omlx"}:
+            raise ValueError(f"unsupported cleanup provider: {self._provider}")
         self._model = cfg["model"]
         self._system = cfg["prompt"]
         # Qwen-family models honor the "/no_think" soft switch in common serving
@@ -34,11 +64,17 @@ class Cleaner:
         self._options = dict(cfg.get("options") or {})
         self._max_ratio = float(cfg.get("max_expansion_ratio", 2.5))
         self._timeout_s = timeout_s
-        self._openai_base_url = str(cfg.get("base_url", "http://localhost:8888/v1")).rstrip("/")
-        self._openai_api_key = self._resolve_api_key(cfg)
-        self._model_path = str(cfg.get("model_path") or self._model)
-        self._fallback_provider = str(cfg.get("fallback_provider", "")).lower()
-        self._client = ollama.Client(timeout=timeout_s) if self._provider == "ollama" else None
+        self._openai_base_url = validate_loopback_http_url(
+            str(cfg.get("base_url", "http://localhost:8888/v1"))
+        )
+        # Managed cleanup credentials are capability tokens for the child this
+        # process just started. They must only arrive through set_api_key after
+        # LocalServiceManager proves that child READY and owned.
+        self._openai_api_key = ""
+        self._client = None
+        if self._provider == "ollama":
+            host = validate_ollama_host(os.environ.get("OLLAMA_HOST", ""))
+            self._client = ollama.Client(host=host, timeout=timeout_s)
 
     def set_api_key(self, api_key: str) -> None:
         """Refresh the local service credential after app-owned startup."""
@@ -46,9 +82,6 @@ class Cleaner:
 
     def warmup(self) -> None:
         """Load the model so the first real dictation is not cold."""
-        if self._provider == "unsloth-cli":
-            self._chat_unsloth_cli("ok", max_tokens=1)
-            return
         if self._provider == "ollama":
             self._client.chat(
                 model=self._model,
@@ -75,19 +108,12 @@ class Cleaner:
         if instruction.strip():
             system += "\n\nWriting mode for this request: " + instruction.strip()
 
-        if self._provider == "unsloth-cli":
-            out = self._chat_unsloth_cli(transcript, cancelled=cancelled, system=system)
-        elif self._provider == "ollama":
+        if self._provider == "ollama":
             out = self._clean_ollama(transcript, cancelled=cancelled, system=system)
         elif self._provider in {"openai-compatible", "omlx"}:
-            try:
-                out = self._chat_openai_compatible(transcript, cancelled=cancelled, system=system)
-            except CleanupCancelled:
-                raise
-            except Exception:
-                if self._fallback_provider != "unsloth-cli":
-                    raise
-                out = self._chat_unsloth_cli(transcript, cancelled=cancelled, system=system)
+            out = self._chat_openai_compatible(
+                transcript, cancelled=cancelled, system=system
+            )
         else:
             raise ValueError(f"unsupported cleanup provider: {self._provider}")
 
@@ -126,78 +152,15 @@ class Cleaner:
         self._check_cancelled(cancelled)
         return resp["message"]["content"] or ""
 
-    def _chat_unsloth_cli(
-        self, transcript: str, max_tokens: int | None = None,
-        cancelled: Event | None = None, system: str | None = None,
-    ) -> str:
-        self._check_cancelled(cancelled)
-        if shutil.which("unsloth") is None:
-            raise RuntimeError("unsloth CLI not found on PATH")
-
-        max_new_tokens = max_tokens
-        if max_new_tokens is None:
-            max_new_tokens = int(self._options.get("max_tokens") or self._options.get("num_predict") or 2048)
-
-        cmd = [
-            "unsloth",
-            "inference",
-            self._model_path,
-            transcript,
-            "--system-prompt",
-            system or self._system,
-            "--max-new-tokens",
-            str(max_new_tokens),
-            "--temperature",
-            str(self._options.get("temperature", 0.2)),
-            "--no-think",
-            "--no-server",
-        ]
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        deadline = time.monotonic() + self._timeout_s
-        try:
-            while True:
-                self._check_cancelled(cancelled)
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise subprocess.TimeoutExpired(cmd, self._timeout_s)
-                try:
-                    stdout, stderr = proc.communicate(timeout=min(0.1, remaining))
-                    break
-                except subprocess.TimeoutExpired:
-                    continue
-        except (CleanupCancelled, subprocess.TimeoutExpired):
-            proc.terminate()
-            try:
-                proc.wait(timeout=1.0)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=1.0)
-            raise
-        if proc.returncode:
-            raise subprocess.CalledProcessError(
-                proc.returncode, cmd, output=stdout, stderr=stderr
-            )
-        return self._parse_unsloth_output(stdout)
-
-    def _parse_unsloth_output(self, output: str) -> str:
-        marker = "Assistant:"
-        if marker in output:
-            return output.rsplit(marker, 1)[1].strip()
-        lines = [line.strip() for line in output.splitlines() if line.strip()]
-        return lines[-1] if lines else ""
-
     def _chat_openai_compatible(
         self, transcript: str, max_tokens: int | None = None,
         cancelled: Event | None = None, system: str | None = None,
     ) -> str:
         self._check_cancelled(cancelled)
         if not self._openai_api_key:
-            raise RuntimeError("cleanup API key missing; set cleanup.api_key or its api_key_env")
+            raise RuntimeError(
+                "cleanup service credential unavailable; managed service is not READY"
+            )
 
         options = self._openai_options(max_tokens=max_tokens)
         payload = {
@@ -220,7 +183,7 @@ class Cleaner:
             method="POST",
         )
         try:
-            with request.urlopen(req, timeout=self._timeout_s) as resp:
+            with open_local_request(req, timeout=self._timeout_s) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
         except URLError as exc:
             raise RuntimeError(f"cleanup server unavailable at {self._openai_base_url}") from exc
@@ -228,25 +191,6 @@ class Cleaner:
         choice = (body.get("choices") or [{}])[0]
         message = choice.get("message") or {}
         return message.get("content") or ""
-
-    def _resolve_api_key(self, cfg: dict) -> str:
-        env_name = str(cfg.get("api_key_env", "")).strip()
-        if env_name:
-            value = os.environ.get(env_name, "").strip()
-            if value:
-                return value
-        configured = str(cfg.get("api_key", "")).strip()
-        if configured:
-            return configured
-        try:
-            from .keychain import CLEANUP_API_KEY_ACCOUNT, KeychainSecretStore
-
-            account = str(
-                cfg.get("api_key_keychain_account") or CLEANUP_API_KEY_ACCOUNT
-            )
-            return KeychainSecretStore().get(account).strip()
-        except Exception:
-            return ""
 
     def _openai_options(self, max_tokens: int | None = None) -> dict:
         options: dict = {}
