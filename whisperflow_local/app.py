@@ -10,10 +10,12 @@ Threading model (PLAN.md):
 from __future__ import annotations
 
 import queue
+import resource
+import sys
 import threading
 import time
+from dataclasses import dataclass
 
-from pynput import keyboard
 from PySide6.QtCore import QObject, QTimer, Signal
 
 from .applog import get_logger
@@ -21,14 +23,42 @@ from .audio import Recorder
 from .cleanup import Cleaner
 from .config import Config
 from .inserter import Inserter, capture_focus_target
+from .metrics import MetricsCollector, PipelineMetric
 from .overlay import VoicePill
-from .stt import Transcriber
+from .evaluation import guarded_cleanup
+from .history import HistoryStore
+from .paths import AppPaths
+from .profiles import resolve_writing_mode
+from .recovery import RecoveryStore
+from .session import SessionEvent, SessionPhase, SessionReducer
+from .stt import Transcriber, audio_rejection_reason
+from .vocabulary import VocabularyData, VocabularyStore
 
 IDLE, RECORDING, PROCESSING = "IDLE", "RECORDING", "PROCESSING"
 
 # sized for up to a ~5 min dictation (batch STT + LLM cleanup both run at stop)
 STT_TIMEOUT_S = 90.0
 CLEANUP_TIMEOUT_S = 90.0
+
+
+@dataclass(frozen=True)
+class ProcessResult:
+    ok: bool
+    reason: str = ""
+    recovered_to_clipboard: bool = False
+
+
+def start_audio_session(recorder, play_start_cue) -> None:
+    """Finish the PortAudio output cue before opening microphone input."""
+    play_start_cue()
+    recorder.start()
+
+
+def stop_audio_session(recorder, play_stop_cue):
+    """Close microphone input before opening the PortAudio output cue."""
+    audio = recorder.stop()
+    play_stop_cue()
+    return audio
 
 
 class Controller(QObject):
@@ -39,12 +69,45 @@ class Controller(QObject):
     show_overlay = Signal()
     hide_overlay = Signal()
     fail_signal = Signal(str)  # worker -> main: nothing inserted (empty/abort/error)
+    phase_signal = Signal(int, object)
+    process_complete = Signal(int, object)
+    health_signal = Signal(str, str)
+    interrupt_signal = Signal(str)
 
     def __init__(self, cfg: Config) -> None:
         super().__init__()
         self.cfg = cfg
         self.log = get_logger(cfg.logging.get("metadata_only", True))
-        self.state = IDLE
+        self.sessions = SessionReducer()
+        self.metrics = MetricsCollector(self.log)
+        personal = cfg.personalization
+        replacements = tuple(
+            (str(pair[0]), str(pair[1]))
+            for pair in personal.get("replacements", [])
+            if isinstance(pair, (list, tuple)) and len(pair) == 2
+        )
+        configured_vocabulary = VocabularyData(
+            tuple(str(term) for term in personal.get("vocabulary", [])), replacements
+        )
+        try:
+            stored_vocabulary = VocabularyStore(
+                AppPaths.discover().support / "vocabulary.json"
+            ).load()
+            self.vocabulary = stored_vocabulary if (
+                stored_vocabulary.terms or stored_vocabulary.replacements
+            ) else configured_vocabulary
+        except (OSError, ValueError):
+            self.vocabulary = configured_vocabulary
+        self.recovery = RecoveryStore(int(cfg.privacy.get("recovery_ttl_seconds", 900)))
+        self._writing_mode = str(personal.get("writing_mode", "natural"))
+        self._per_app_modes = dict(personal.get("per_app_modes", {}))
+        history = cfg.history
+        self.history = HistoryStore(
+            AppPaths.discover().support / "history.json",
+            enabled=bool(history.get("enabled", False)),
+            retention_days=int(history.get("retention_days", 7)),
+        )
+        self._warmup_complete = False
 
         self.rms_q: "queue.Queue[float]" = queue.Queue(maxsize=64)
         # on max_seconds overflow the (PortAudio-thread) callback emits a queued
@@ -55,10 +118,15 @@ class Controller(QObject):
         self.stt = Transcriber(cfg.stt)
         self.cleaner = Cleaner(cfg.cleanup)
         self.inserter = Inserter(cfg.insert)
+        # Timed-out native/model work cannot be force-killed safely. Serializing
+        # each backend prevents a newer session from running the same model
+        # concurrently while the obsolete call winds down.
+        self._stt_lock = threading.Lock()
+        self._cleanup_lock = threading.Lock()
 
         self.pill = VoicePill()
+        self.pill.set_device_name(self.recorder.device_label)
         self._sr = int(cfg.audio["sample_rate"])
-        self._enter_listener: keyboard.Listener | None = None
         self._sound = cfg.sound
 
         # overlay level pump (main-thread timer)
@@ -72,10 +140,26 @@ class Controller(QObject):
         self.show_overlay.connect(self._show)
         self.hide_overlay.connect(self._hide)
         self.fail_signal.connect(self._on_fail)
+        self.phase_signal.connect(self._on_worker_phase)
+        self.process_complete.connect(self._on_process_complete)
+        self.interrupt_signal.connect(self._on_interrupt)
+
+    @property
+    def state(self) -> str:
+        phase = self.sessions.current.phase
+        if phase in {SessionPhase.IDLE, SessionPhase.READY,
+                     SessionPhase.CANCELLED, SessionPhase.ERROR}:
+            return IDLE
+        if phase in {SessionPhase.STARTING, SessionPhase.RECORDING}:
+            return RECORDING
+        return PROCESSING
 
     # -- called from the pynput thread ---------------------------------------
     def on_hotkey(self) -> None:
         self.toggle_requested.emit()
+
+    def on_system_event(self, event: str) -> None:
+        self.interrupt_signal.emit(event)
 
     # -- main-thread slots ----------------------------------------------------
     def _on_toggle(self) -> None:
@@ -98,52 +182,141 @@ class Controller(QObject):
         """Esc during RECORDING: discard audio, no STT/cleanup/paste."""
         if self.state != RECORDING:
             return
-        self.state = IDLE
-        self._stop_enter_stop()
+        session = self.sessions.current
+        self.sessions.transition(session.session_id, SessionEvent.CANCELLED)
         self._pump.stop()
         self.hide_overlay.emit()
         self.recorder.stop()  # drop the buffer; nothing is processed
         self._beep_cancel()
         self.log.info("state=IDLE (cancelled)")
 
+    def _on_interrupt(self, event: str) -> None:
+        """Fail closed on sleep, device loss, or other native interruptions."""
+        session = self.sessions.current
+        if self.state == RECORDING:
+            self._pump.stop()
+            self.hide_overlay.emit()
+            self.recorder.stop()
+        if self.state != IDLE:
+            try:
+                self.sessions.transition(session.session_id, SessionEvent.CANCELLED)
+            except ValueError:
+                self.sessions.fail(session.session_id, f"interrupted:{event}")
+        self.health_signal.emit("degraded", f"interrupted: {event}")
+        self.log.info("session interrupted event=%s", event)
+
     def _start_recording(self) -> None:
-        self.state = RECORDING
-        self._beep(self._sound.get("start_freq", 920))
-        self.recorder.start()
+        session = self.sessions.start()
+        try:
+            start_audio_session(
+                self.recorder,
+                lambda: self._beep(self._sound.get("start_freq", 920)),
+            )
+        except Exception as exc:
+            self.sessions.fail(session.session_id, "microphone_unavailable")
+            self.fail_signal.emit(f"microphone unavailable: {type(exc).__name__}")
+            return
+        self.sessions.transition(session.session_id, SessionEvent.RECORDING_STARTED)
         self.show_overlay.emit()
         self._pump.start()
-        self._start_enter_stop()  # Enter also finishes (only while recording)
         self.log.info("state=RECORDING")
 
     def _stop_and_process(self) -> None:
-        self.state = PROCESSING
-        self._beep(self._sound.get("stop_freq", 560))
-        self._stop_enter_stop()
+        session = self.sessions.current
+        self.sessions.transition(session.session_id, SessionEvent.RECORDING_STOPPED)
         self._pump.stop()
         self.hide_overlay.emit()
+        audio = stop_audio_session(
+            self.recorder,
+            lambda: self._beep(self._sound.get("stop_freq", 560)),
+        )
         target = capture_focus_target()  # snapshot focus at STOP
-        audio = self.recorder.stop()
-        self.log.info("state=PROCESSING audio_s=%.2f overflow=%s",
-                      audio.size / self._sr, self.recorder.overflowed)
-        threading.Thread(target=self._process, args=(audio, target), daemon=True).start()
+        self.log.info(
+            "state=PROCESSING audio_s=%.2f rms=%.6f device=%s overflow=%s",
+            audio.size / self._sr, self.recorder.rms_of(audio),
+            self.recorder.device_label, self.recorder.overflowed,
+        )
+        threading.Thread(
+            target=self._process,
+            args=(session.session_id, session.cancelled, audio, target),
+            daemon=True,
+        ).start()
 
-    def _process(self, audio, target) -> None:
+    def _process(self, session_id, cancelled, audio, target) -> None:
         t0 = time.perf_counter()
+        was_warm = self._warmup_complete
         try:
-            transcript = _with_timeout(
-                lambda: self.stt.transcribe(audio, self._sr), STT_TIMEOUT_S, ""
+            self.phase_signal.emit(session_id, SessionEvent.TRANSCRIPTION_STARTED)
+            completed, transcript = _with_timeout(
+                lambda: _locked_call(
+                    self._stt_lock, self.stt.transcribe, audio, self._sr
+                ),
+                STT_TIMEOUT_S,
+                "",
             )
             t_stt = time.perf_counter()
+            if not completed:
+                cancelled.set()
+                self._record_metric(
+                    session_id, audio, t0, t_stt, t_stt, t_stt,
+                    "stt_timeout", was_warm,
+                )
+                self.process_complete.emit(
+                    session_id, ProcessResult(False, "transcription timed out")
+                )
+                return
+            if cancelled.is_set():
+                return
             if not transcript:
-                self.log.info("stt=empty -> no insert")
+                rejection = audio_rejection_reason(audio, self._sr, self.cfg.stt)
+                reason = {
+                    "too_short": "recording too short",
+                    "no_input_signal": f"no microphone signal from {self.recorder.device_label}",
+                }.get(rejection, "no speech detected")
+                self.log.info("stt=empty reason=%s -> no insert", rejection or "model")
                 print(f"[timing] stt={ (t_stt-t0)*1000:.0f}ms -> empty, no insert",
                       flush=True)
-                self.fail_signal.emit("no speech detected")
+                self.process_complete.emit(
+                    session_id, ProcessResult(False, reason)
+                )
+                self._record_metric(
+                    session_id, audio, t0, t_stt, t_stt, t_stt,
+                    "no_speech", was_warm,
+                )
                 return
-            cleaned = _with_timeout(
-                lambda: self.cleaner.clean(transcript), CLEANUP_TIMEOUT_S, transcript
+            transcript = self.vocabulary.apply(transcript)
+            self.phase_signal.emit(session_id, SessionEvent.TRANSCRIPTION_FINISHED)
+            mode = resolve_writing_mode(
+                self._writing_mode, getattr(target, "bundle_id", ""), self._per_app_modes
+            )
+            vocabulary_instruction = ""
+            if self.vocabulary.terms:
+                vocabulary_instruction = " Preferred spellings: " + ", ".join(self.vocabulary.terms) + "."
+            completed, cleaned = _with_timeout(
+                lambda: _locked_call(
+                    self._cleanup_lock, self.cleaner.clean, transcript, cancelled,
+                    mode.instruction + vocabulary_instruction,
+                ),
+                CLEANUP_TIMEOUT_S,
+                transcript,
             )
             t_clean = time.perf_counter()
+            if not completed:
+                cancelled.set()
+                stashed = self._stash_to_clipboard(transcript)
+                self._record_metric(
+                    session_id, audio, t0, t_stt, t_clean, t_clean,
+                    "cleanup_timeout", was_warm,
+                )
+                self.process_complete.emit(
+                    session_id, ProcessResult(False, "cleanup timed out", stashed)
+                )
+                return
+            if cancelled.is_set():
+                return
+            cleaned = guarded_cleanup(transcript, cleaned)
+            self.history.add(cleaned)
+            self.phase_signal.emit(session_id, SessionEvent.CLEANUP_FINISHED)
             ok, reason = self.inserter.insert(cleaned, target)
             t_ins = time.perf_counter()
             if not ok:
@@ -151,9 +324,15 @@ class Controller(QObject):
                 # so the user can paste it manually (esp. on focus_changed)
                 stashed = self._stash_to_clipboard(cleaned)
                 detail = reason or "insert failed"
-                self.fail_signal.emit(
-                    f"{detail} — text on clipboard" if stashed else detail
+                self.process_complete.emit(
+                    session_id, ProcessResult(False, detail, stashed)
                 )
+            else:
+                self.process_complete.emit(session_id, ProcessResult(True))
+            self._record_metric(
+                session_id, audio, t0, t_stt, t_clean, t_ins,
+                "inserted" if ok else (reason or "insert_failed"), was_warm,
+            )
             audio_s = audio.size / self._sr
             print(
                 f"[timing] audio={audio_s:.1f}s | stt={(t_stt-t0)*1000:.0f}ms "
@@ -169,17 +348,66 @@ class Controller(QObject):
             )
         except Exception as exc:  # guarantee return to IDLE
             self.log.exception("process error: %s", type(exc).__name__)
-            self.fail_signal.emit(f"error: {type(exc).__name__}")
-        finally:
-            self.state = IDLE
-            self.log.info("state=IDLE")
+            self.process_complete.emit(
+                session_id, ProcessResult(False, f"error: {type(exc).__name__}")
+            )
+
+    def _record_metric(
+        self, session_id, audio, t0, t_stt, t_clean, t_ins,
+        outcome: str, was_warm: bool,
+    ) -> None:
+        self.metrics.observe(PipelineMetric(
+            session_id=session_id,
+            audio_seconds=audio.size / self._sr,
+            stt_ms=(t_stt - t0) * 1000,
+            cleanup_ms=(t_clean - t_stt) * 1000,
+            insert_ms=(t_ins - t_clean) * 1000,
+            total_ms=(t_ins - t0) * 1000,
+            outcome=outcome,
+            stt_warm=was_warm,
+            cleanup_warm=was_warm,
+            peak_memory_mb=_peak_memory_mb(),
+            backend_health="ready" if was_warm else "warming",
+        ))
+
+    def _on_worker_phase(self, session_id: int, event: object) -> None:
+        if not self.sessions.is_active(session_id):
+            return
+        try:
+            self.sessions.transition(session_id, event)
+        except ValueError as exc:
+            self.log.warning("ignored worker phase: %s", exc)
+
+    def _on_process_complete(self, session_id: int, result: object) -> None:
+        if session_id != self.sessions.current.session_id:
+            self.log.info("ignored stale result session=%s", session_id)
+            return
+        if not isinstance(result, ProcessResult):
+            self.sessions.fail(session_id, "invalid_worker_result")
+            self._on_fail("invalid worker result")
+            return
+        if result.ok:
+            try:
+                self.sessions.transition(session_id, SessionEvent.INSERTION_FINISHED)
+            except ValueError as exc:
+                self.sessions.fail(session_id, "invalid_completion_order")
+                self._on_fail(str(exc))
+                return
+            self.log.info("state=READY")
+            return
+        self.sessions.fail(session_id, result.reason)
+        detail = result.reason
+        if result.recovered_to_clipboard:
+            detail += " — text on clipboard"
+        self._on_fail(detail)
 
     def _stash_to_clipboard(self, text: str) -> bool:
         """Best-effort: put uninserted text on the clipboard for manual paste."""
+        self.recovery.add(text, "automatic insertion unavailable")
         try:
-            import pyperclip
+            from . import clipboard
 
-            pyperclip.copy(text)
+            clipboard.copy(text)
             return True
         except Exception as exc:
             self.log.warning("clipboard stash failed: %s", exc)
@@ -192,35 +420,6 @@ class Controller(QObject):
         self.pill.flash_error()
         self._beep_error()
 
-    # -- Enter-to-finish / Esc-to-cancel (active only during RECORDING) -------
-    def _start_enter_stop(self) -> None:
-        VK_RETURN = 0x0D
-        VK_ESCAPE = 0x1B
-
-        def win32_filter(msg, data):
-            if self.state != RECORDING:
-                return
-            if data.vkCode == VK_RETURN:
-                # Trigger the stop FIRST: suppress_event() raises a sentinel to
-                # swallow the keystroke (no stray newline), so anything after it
-                # would be dead code.
-                self.toggle_requested.emit()
-                self._enter_listener.suppress_event()
-            elif data.vkCode == VK_ESCAPE:
-                # Discard the recording; swallow the Esc so it doesn't leak.
-                self.cancel_requested.emit()
-                self._enter_listener.suppress_event()
-
-        self._enter_listener = keyboard.Listener(
-            on_press=lambda k: None, win32_event_filter=win32_filter
-        )
-        self._enter_listener.start()
-
-    def _stop_enter_stop(self) -> None:
-        if self._enter_listener is not None:
-            self._enter_listener.stop()
-            self._enter_listener = None
-
     def _drain_rms(self) -> None:
         level = 0.0
         try:
@@ -230,7 +429,7 @@ class Controller(QObject):
             pass
         # perceptual scaling: a power curve lifts quiet/normal speech so the
         # waves react well below shouting volume (linear felt dead at low input)
-        self.pill.set_level(min(1.0, (level * 7.0) ** 0.55))
+        self.pill.set_level(level)
 
     def _show(self) -> None:
         if self.cfg.overlay.get("enabled", True):
@@ -272,15 +471,19 @@ class Controller(QObject):
         )
 
     def warmup(self) -> None:
-        self.stt.load()
+        with self._stt_lock:
+            self.stt.load()
         try:
-            self.cleaner.warmup()
+            with self._cleanup_lock:
+                self.cleaner.warmup()
         except Exception as exc:
             self.log.warning("cleanup warmup failed: %s", exc)
+        finally:
+            self._warmup_complete = True
 
 
 def _with_timeout(fn, timeout_s: float, fallback):
-    """Run fn on a thread; return its result or `fallback` if it overruns."""
+    """Run fn on a thread and report whether it completed before its deadline."""
     result = {"value": fallback}
 
     def runner():
@@ -290,5 +493,15 @@ def _with_timeout(fn, timeout_s: float, fallback):
     t.start()
     t.join(timeout_s)
     if t.is_alive():
-        return fallback
-    return result["value"]
+        return False, fallback
+    return True, result["value"]
+
+
+def _locked_call(lock, fn, *args):
+    with lock:
+        return fn(*args)
+
+
+def _peak_memory_mb() -> float:
+    value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return value / (1024 * 1024) if sys.platform == "darwin" else value / 1024

@@ -1,61 +1,50 @@
-"""Launch-on-login via a Startup-folder shortcut (Windows).
-
-Writes a ``.lnk`` into the per-user Startup folder that runs the app windowless
-(``pythonw.exe -m whisperflow_local run``) from the repo directory. No registry
-edits, no admin — drop the shortcut to uninstall. ``pythonw`` (not ``python``)
-so there's no console window; the tray icon is the only visible surface.
-"""
+"""Launch-on-login support for the installed bundle or development interpreter."""
 from __future__ import annotations
 
-import os
+import plistlib
 import sys
 from pathlib import Path
 
-_LNK_NAME = "WhisperFlowLocal.lnk"
-_REPO = Path(__file__).resolve().parents[1]
+from .paths import BUNDLE_ID
+
+_LAUNCH_AGENT_LABEL = BUNDLE_ID
+_LAUNCH_AGENT_NAME = f"{_LAUNCH_AGENT_LABEL}.plist"
 
 
-def _startup_dir() -> Path:
-    return (
-        Path(os.environ["APPDATA"])
-        / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
-    )
-
-
-def _lnk_path() -> Path:
-    return _startup_dir() / _LNK_NAME
-
-
-def _pythonw() -> Path:
-    """The windowless interpreter sibling of the current python.exe."""
-    exe = Path(sys.executable)
-    pyw = exe.with_name("pythonw.exe")
-    return pyw if pyw.exists() else exe  # fall back to python.exe if absent
+def _path() -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / _LAUNCH_AGENT_NAME
 
 
 def is_installed() -> bool:
-    return _lnk_path().exists()
+    return _path().exists()
 
 
 def install() -> str:
-    import win32com.client  # pywin32, already a dependency
-
-    lnk = _lnk_path()
-    lnk.parent.mkdir(parents=True, exist_ok=True)
-    shell = win32com.client.Dispatch("WScript.Shell")
-    sc = shell.CreateShortcut(str(lnk))
-    sc.TargetPath = str(_pythonw())
-    sc.Arguments = "-m whisperflow_local run"
-    sc.WorkingDirectory = str(_REPO)
-    sc.WindowStyle = 7  # minimized (pythonw has no window anyway)
-    sc.Description = "whisperflow-local local dictation (launch on login)"
-    sc.Save()
-    return str(lnk)
+    plist = _path()
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    executable = Path(sys.executable).resolve()
+    # Frozen apps run their own bundle executable directly. Development keeps a
+    # module argument but never relies on a repository working directory.
+    arguments = [str(executable)]
+    if not getattr(sys, "frozen", False) and ".app/Contents/MacOS/" not in str(executable):
+        arguments.extend(["-m", "whisperflow_local", "run"])
+    payload = {
+        "Label": _LAUNCH_AGENT_LABEL,
+        "ProgramArguments": arguments,
+        "RunAtLoad": True,
+        "KeepAlive": False,
+        "StandardOutPath": str(Path.home() / "Library" / "Logs" / "whisperflow-local.out.log"),
+        "StandardErrorPath": str(Path.home() / "Library" / "Logs" / "whisperflow-local.err.log"),
+    }
+    with open(plist, "wb") as fh:
+        plistlib.dump(payload, fh)
+    plist.chmod(0o600)
+    return str(plist)
 
 
 def uninstall() -> bool:
-    lnk = _lnk_path()
-    if lnk.exists():
-        lnk.unlink()
+    plist = _path()
+    if plist.exists():
+        plist.unlink()
         return True
     return False

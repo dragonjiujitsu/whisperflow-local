@@ -1,113 +1,110 @@
-"""Speech-to-text via faster-whisper, with confidence gating.
-
-Rejects empty/hallucinated output (Whisper emits phantom text on silence) using
-the thresholds in config: min duration, RMS floor, no_speech_prob, avg logprob.
-"""
+"""App-owned local speech-to-text through MLX on Apple Silicon."""
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 from pathlib import Path
 
 import numpy as np
 
+from .paths import AppPaths
 
-def _register_cuda_dlls() -> None:
-    """ctranslate2 doesn't auto-load the pip NVIDIA CUDA DLLs on Windows.
-    Add the nvidia/*/bin dirs (cuBLAS, cuDNN) to the DLL search path so
-    cublas64_12.dll / cudnn*.dll resolve."""
-    if sys.platform != "win32":
-        return
-    import site as _site
-    import sysconfig
+MODEL_REPOS = {
+    "tiny": {"base": "mlx-community/whisper-tiny", "4bit": "mlx-community/whisper-tiny-mlx-4bit", "8bit": "mlx-community/whisper-tiny-mlx-8bit"},
+    "small": {"base": "mlx-community/whisper-small-mlx", "4bit": "mlx-community/whisper-small-mlx-4bit", "8bit": "mlx-community/whisper-small-mlx-8bit"},
+    "base": {"base": "mlx-community/whisper-base-mlx", "4bit": "mlx-community/whisper-base-mlx-4bit", "8bit": "mlx-community/whisper-base-mlx-8bit"},
+    "medium": {"base": "mlx-community/whisper-medium-mlx", "4bit": "mlx-community/whisper-medium-mlx-4bit", "8bit": "mlx-community/whisper-medium-mlx-8bit"},
+    "large-v2": {"base": "mlx-community/whisper-large-v2-mlx", "4bit": "mlx-community/whisper-large-v2-mlx-4bit", "8bit": "mlx-community/whisper-large-v2-mlx-8bit"},
+    "large-v3": {"base": "mlx-community/whisper-large-v3-mlx", "4bit": "mlx-community/whisper-large-v3-mlx-4bit", "8bit": "mlx-community/whisper-large-v3-mlx-8bit"},
+    "distil-small.en": {"base": "mustafaaljadery/distil-whisper-mlx"},
+    "distil-medium.en": {"base": "mustafaaljadery/distil-whisper-mlx"},
+    "distil-large-v2": {"base": "mustafaaljadery/distil-whisper-mlx"},
+    "distil-large-v3": {"base": "mustafaaljadery/distil-whisper-mlx"},
+}
 
-    roots: set[str] = set(sys.path)
-    for key in ("purelib", "platlib"):
-        p = sysconfig.get_paths().get(key)
-        if p:
-            roots.add(p)
-    try:
-        roots.update(_site.getsitepackages())
-    except Exception:
-        pass
 
-    roots.add(str(Path(sys.prefix) / "Lib" / "site-packages"))
-
-    bin_dirs: list[str] = []
-    for root in roots:
-        nvidia = Path(root) / "nvidia"
-        if not nvidia.is_dir():
-            continue
-        for binp in nvidia.glob("*/bin"):
-            bin_dirs.append(str(binp))
-
-    for binp in dict.fromkeys(bin_dirs):  # dedup, keep order
-        try:
-            os.add_dll_directory(binp)
-        except (OSError, FileNotFoundError):
-            pass
-    # ctranslate2's own loader searches PATH (not add_dll_directory dirs),
-    # so prepend the CUDA bin dirs to PATH as well — this is what actually
-    # resolves cublas64_12.dll / cudnn*.dll at encode time.
-    if bin_dirs:
-        os.environ["PATH"] = os.pathsep.join(bin_dirs) + os.pathsep + os.environ.get("PATH", "")
+def audio_rejection_reason(audio: np.ndarray, sample_rate: int, cfg: dict) -> str:
+    duration = audio.size / sample_rate
+    rms = float(np.sqrt(np.mean(audio ** 2))) if audio.size else 0.0
+    if duration < float(cfg["min_duration_s"]):
+        return "too_short"
+    if rms < float(cfg["min_rms"]):
+        return "no_input_signal"
+    return ""
 
 
 class Transcriber:
-    def __init__(self, cfg: dict) -> None:
+    def __init__(self, cfg: dict, paths: AppPaths | None = None) -> None:
+        if sys.platform != "darwin":
+            raise RuntimeError("whisperflow-local is configured for macOS Apple Silicon")
         self._cfg = cfg
-        self._model = None  # lazy: importing faster_whisper loads CUDA libs
-        self._pipe = None   # batched pipeline (or the model itself)
+        self._paths = paths or AppPaths.discover()
+        self._model_path: Path | None = None
+        self._transcribe_audio = None
+
+    @property
+    def model_path(self) -> Path:
+        name = _model_name(self._cfg)
+        return self._paths.models / "Speech" / name
 
     def load(self) -> None:
-        _register_cuda_dlls()
-        from faster_whisper import BatchedInferencePipeline, WhisperModel
+        from lightning_whisper_mlx.transcribe import transcribe_audio
 
-        self._model = WhisperModel(
-            self._cfg["model"],
-            device=self._cfg.get("device", "cuda"),
-            compute_type=self._cfg.get("compute_type", "float16"),
-        )
-        if self._cfg.get("batched", True):
-            self._pipe = BatchedInferencePipeline(model=self._model)
-        else:
-            self._pipe = self._model
+        self._model_path = ensure_speech_model(self._cfg, self._paths)
+        self._transcribe_audio = transcribe_audio
 
     def transcribe(self, audio: np.ndarray, sample_rate: int) -> str:
-        if self._model is None:
-            self.load()
-
-        duration = audio.size / sample_rate
-        rms = float(np.sqrt(np.mean(audio ** 2))) if audio.size else 0.0
-        if duration < float(self._cfg["min_duration_s"]):
+        if audio_rejection_reason(audio, sample_rate, self._cfg):
             return ""
-        if rms < float(self._cfg["min_rms"]):
-            return ""
+        if self._model_path is None: self.load()
+        return self._transcribe_mlx(audio, sample_rate)
 
-        beam = int(self._cfg.get("beam_size", 1))
-        if self._cfg.get("batched", True):
-            segments, _info = self._pipe.transcribe(
-                audio,
-                language="en",
-                beam_size=beam,
-                batch_size=int(self._cfg.get("batch_size", 16)),
-                condition_on_previous_text=False,
-            )
-        else:
-            segments, _info = self._model.transcribe(
-                audio,
-                language="en",
-                vad_filter=True,
-                beam_size=beam,
-                condition_on_previous_text=False,
-            )
+    def _transcribe_mlx(self, audio: np.ndarray, sample_rate: int) -> str:
+        if sample_rate != 16000: raise ValueError("lightning-whisper-mlx expects 16 kHz audio")
+        result = self._transcribe_audio(
+            audio.astype(np.float32, copy=False), path_or_hf_repo=str(self._model_path),
+            language="en", batch_size=int(self._cfg.get("batch_size", 12)),
+            condition_on_previous_text=False,
+        )
+        text = result.get("text", "") if isinstance(result, dict) else str(result)
+        return text.strip()
 
-        parts: list[str] = []
-        for seg in segments:
-            if getattr(seg, "no_speech_prob", 0.0) > float(self._cfg["max_no_speech_prob"]):
-                continue
-            if getattr(seg, "avg_logprob", 0.0) < float(self._cfg["min_avg_logprob"]):
-                continue
-            parts.append(seg.text)
 
-        return " ".join(p.strip() for p in parts).strip()
+def ensure_speech_model(cfg: dict, paths: AppPaths) -> Path:
+    destination = paths.models / "Speech" / _model_name(cfg)
+    if _complete(destination): return destination
+    destination.mkdir(parents=True, exist_ok=True, mode=0o700)
+    legacy = Path(__file__).resolve().parents[1] / "mlx_models" / _model_name(cfg)
+    if _complete(legacy):
+        for name in ("weights.npz", "config.json"):
+            _link_or_copy(legacy / name, destination / name)
+        return destination
+    try:
+        from huggingface_hub import hf_hub_download
+        model = str(cfg["model"]); quant = str(cfg.get("quant") or "base")
+        repo = MODEL_REPOS[model][quant]
+        for name in ("weights.npz", "config.json"):
+            remote = f"mlx_models/{_model_name(cfg)}/{name}" if model.startswith("distil") else name
+            cached = Path(hf_hub_download(repo_id=repo, filename=remote))
+            _link_or_copy(cached, destination / name)
+    except Exception:
+        shutil.rmtree(destination, ignore_errors=True)
+        raise
+    return destination
+
+
+def _model_name(cfg: dict) -> str:
+    model = str(cfg["model"]); quant = cfg.get("quant")
+    suffix = {"4bit": "4-bit", "8bit": "8-bit"}.get(str(quant), str(quant))
+    return f"{model}-{suffix}" if quant and model.startswith("distil") else model
+
+
+def _complete(path: Path) -> bool:
+    return (path / "weights.npz").is_file() and (path / "config.json").is_file()
+
+
+def _link_or_copy(source: Path, destination: Path) -> None:
+    if destination.exists(): return
+    try: os.link(source, destination)
+    except OSError: shutil.copy2(source, destination)

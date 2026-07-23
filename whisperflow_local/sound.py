@@ -1,5 +1,4 @@
-"""Soft, non-blocking audio cues — a gentle sine with raised-cosine fades so
-there's no harsh click/onset (unlike winsound.Beep's square wave)."""
+"""Short serialized audio cues with raised-cosine fades and no harsh onset."""
 from __future__ import annotations
 
 import numpy as np
@@ -22,7 +21,10 @@ def play_tone(freq: float, ms: int, volume: float) -> None:
     env[-fade:] *= ramp[::-1]
     out = (wave * env * volume).astype(np.float32)
     try:
-        sd.play(out, _SR)  # non-blocking; own output stream
+        # A non-blocking convenience stream can overlap the microphone input
+        # stream and deadlock CoreAudio/PortAudio on macOS. Wait for this short
+        # cue to finish so its output stream is closed before recording starts.
+        sd.play(out, _SR, blocking=True)
     except Exception:
         pass
 
@@ -44,6 +46,6 @@ def play_error(freq: float, volume: float) -> None:
     env[-fade:] *= ramp[::-1]
     out = (tone * env * volume * 1.4).astype(np.float32)  # a touch louder than the soft cues
     try:
-        sd.play(out, _SR)
+        sd.play(out, _SR, blocking=True)
     except Exception:
         pass

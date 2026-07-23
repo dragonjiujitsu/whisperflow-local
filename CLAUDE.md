@@ -1,77 +1,82 @@
 # whisperflow-local — guide for Claude Code
 
-This is a 100% local WhisperFlow clone for Windows: tap `Ctrl+Win`, speak, and
-cleaned text is pasted into the focused field. STT runs on `faster-whisper`
-(CUDA); cleanup runs on a local Ollama model. No cloud at dictation time.
+This repo is now targeted at macOS Apple Silicon: tap `Cmd+Shift+Space`, speak,
+and cleaned text is pasted into the focused field. STT runs locally with
+`lightning-whisper-mlx`; cleanup prefers local Unsloth Studio server inference
+with direct Unsloth CLI fallback. No cloud calls at dictation time after one-time
+model downloads.
 
-When a user asks you to **set this up on their machine**, run the setup flow below
-and fix failures until `doctor` passes. When they ask how it works, point them at
-`PLAN.md` and `docs/architecture.html`.
+## Setup
 
-## Setup flow (run in order)
+1. Use Python 3.11+ with `uv`:
 
-1. **Python env + deps** — requires Python 3.11+ and `uv`:
    ```bash
    uv venv --python 3.11
    uv pip install -e .
    ```
-   If `uv` is missing, install it first (https://docs.astral.sh/uv/).
 
-2. **Ollama + cleanup model** — the cleanup LLM runs on Ollama:
-   - Confirm Ollama is installed (`ollama --version`) and running. If not,
-     point the user to https://ollama.com/download (it installs as an
-     auto-starting service).
-   - Read `cleanup.model` from `config.yaml`, then `ollama pull <that model>`
-     (currently `granite4.1:3b`). The model is small and kept warm via
-     `keep_alive` so dictation latency stays low.
+2. Optionally inspect the persistent cleanup-server command:
 
-3. **Validate** — run the doctor and resolve every failing check:
    ```bash
-   .venv/Scripts/python.exe -m whisperflow_local doctor
+   .venv/bin/python -m whisperflow_local cleanup-server-command
    ```
-   It checks microphone, CUDA, Ollama (+ model present, loopback-only),
-   clipboard, and the hotkey/overlay imports.
 
-4. **Run it**:
+   Normal `run` owns this lifecycle, stores the generated key in macOS Keychain,
+   and falls back to direct `unsloth-cli` inference if the warm service is unavailable.
+
+3. Run doctor from the venv:
+
    ```bash
-   .venv/Scripts/python.exe -m whisperflow_local run
+   .venv/bin/python -m whisperflow_local doctor
    ```
-   For always-on, `... install-autostart` writes a windowless Startup shortcut.
 
-## Known gotchas (fix these when doctor fails)
+   It checks microphone input, the MLX STT backend, the selected cleanup provider
+   plus model, clipboard access, and hotkey/overlay imports.
 
-- **CUDA / `cuda` check fails** — `faster-whisper` (via `ctranslate2`) needs the
-  cuDNN/cuBLAS DLLs on the path. On Windows the usual fix is installing the
-  matching NVIDIA cuDNN, or `pip install nvidia-cudnn-cu12 nvidia-cublas-cu12`
-  into the venv so the DLLs ship alongside. If no usable GPU, set
-  `stt.device: "cpu"` in `config.yaml` (much slower) and warn the user.
-- **`ollama` check fails / model MISSING** — Ollama service not running, or the
-  model in `config.yaml` hasn't been pulled. Pull it, or change `cleanup.model`
-  to one the user already has (`ollama list`).
-- **Hotkey does nothing** — `Ctrl+Win` is the default. It's a modifier pair with
-  no built-in OS action (Wispr Flow's approach), so it shouldn't collide. If the
-  user wants a different key, edit `hotkey.combo` in `config.yaml`. Avoid
-  reserved single `Win+<letter>` combos (e.g. Win+F opens Feedback Hub).
-- **Paste lands in the wrong app / nothing** — insertion re-verifies focus; if
-  focus moved, it aborts and stashes the text on the clipboard. Elevated/RDP/
-  anti-cheat windows reject synthetic input (documented limitation).
+4. Run the app:
+
+   ```bash
+   .venv/bin/python -m whisperflow_local run
+   ```
+
+## macOS Permissions
+
+Grant Accessibility permission to the terminal/app that runs whisperflow-local so
+`pynput` can observe the global hotkey and synthesize paste. Grant Microphone
+permission for capture. If the hotkey or paste does nothing, check System Settings
+-> Privacy & Security -> Accessibility.
+
+## Model Choices
+
+- STT default: `distil-large-v3` via `lightning-whisper-mlx`, `quant: null`.
+  This is the speed-first local dictation default for Apple Silicon.
+- Cleanup default: Unsloth Studio serving `unsloth/Qwen3.5-4B-MTP-GGUF` as
+  `default` on `http://localhost:8888/v1`, with direct Unsloth CLI fallback to
+  `Qwen3.5-4B-UD-Q4_K_XL.gguf`. The 4B model is a better latency fit than the
+  local 35B Qwen cache.
+
+If quality is not good enough, switch `stt.model` to `large-v3` and reduce `stt.batch_size` to `6` if latency remains acceptable.
 
 ## Commands
 
-| Command | What |
-|---|---|
-| `doctor` | environment health check |
-| `run` | live app (tray + hotkey) |
-| `selftest` | autonomous end-to-end on a bundled spoken sample |
-| `install-autostart` / `uninstall-autostart` | launch on login (windowless) |
+```bash
+.venv/bin/python -m whisperflow_local run
+.venv/bin/python -m whisperflow_local selftest
+.venv/bin/python -m whisperflow_local doctor
+.venv/bin/python -m whisperflow_local cleanup-server-command
+.venv/bin/python -m whisperflow_local set-cleanup-key
+.venv/bin/python -m whisperflow_local delete-cleanup-key
+.venv/bin/python -m whisperflow_local install-autostart
+.venv/bin/python -m whisperflow_local uninstall-autostart
+```
 
-Always invoke via the venv interpreter (`.venv/Scripts/python.exe`) so the right
-deps are used.
+## Files
 
-## Layout
-
-`whisperflow_local/` — `app.py` (orchestrator + state machine), `audio.py`
-(capture), `stt.py`, `cleanup.py`, `inserter.py` (focus-safe paste), `overlay.py`
-(the pill), `tray.py`, `autostart.py`, `hotkey.py`, `sound.py`, `config.py`.
-Config is `config.yaml`. `tools/` renders the icon. `docs/architecture.html` is
-the visual explainer.
+`whisperflow_local/app.py` is the orchestrator and state machine.
+`audio.py` records 16 kHz mono float32 audio.
+`stt.py` uses `lightning-whisper-mlx` for local Apple Silicon transcription.
+`cleanup.py` supports Unsloth CLI, Ollama, and OpenAI-compatible servers; config
+currently selects the OpenAI-compatible Unsloth Studio path with Unsloth CLI fallback.
+`inserter.py` snapshots the focused Accessibility element and window, uses a
+multi-format NSPasteboard transaction, and pastes with `Cmd+V` only after revalidation.
+`autostart.py` writes a user LaunchAgent on macOS.

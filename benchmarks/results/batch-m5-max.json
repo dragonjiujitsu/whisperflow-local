@@ -1,0 +1,81 @@
+{
+  "backend": "batch",
+  "cleanup_model": "default",
+  "cleanup_provider": "openai-compatible",
+  "cold_warmup_ms": 1099.6,
+  "machine": "arm64",
+  "macos": "26.5.2",
+  "peak_rss_mb": 2222.4,
+  "profiles": {
+    "long": {
+      "audio_seconds": 60.0,
+      "cleanup": {
+        "max_ms": 3488.4,
+        "min_ms": 3487.1,
+        "p50_ms": 3487.7,
+        "p95_ms": 3488.3
+      },
+      "stt": {
+        "max_ms": 1903.9,
+        "min_ms": 1656.8,
+        "p50_ms": 1780.4,
+        "p95_ms": 1891.6
+      },
+      "total": {
+        "max_ms": 5392.3,
+        "min_ms": 5143.9,
+        "p50_ms": 5268.1,
+        "p95_ms": 5379.9
+      }
+    },
+    "medium": {
+      "audio_seconds": 10.0,
+      "cleanup": {
+        "max_ms": 3744.0,
+        "min_ms": 3489.6,
+        "p50_ms": 3616.8,
+        "p95_ms": 3731.3
+      },
+      "stt": {
+        "max_ms": 295.8,
+        "min_ms": 294.7,
+        "p50_ms": 295.2,
+        "p95_ms": 295.7
+      },
+      "total": {
+        "max_ms": 4039.8,
+        "min_ms": 3784.3,
+        "p50_ms": 3912.1,
+        "p95_ms": 4027.1
+      }
+    },
+    "short": {
+      "audio_seconds": 2.0,
+      "cleanup": {
+        "max_ms": 6005.8,
+        "min_ms": 3402.6,
+        "p50_ms": 4704.2,
+        "p95_ms": 5875.6
+      },
+      "stt": {
+        "max_ms": 593.0,
+        "min_ms": 250.3,
+        "p50_ms": 421.6,
+        "p95_ms": 575.8
+      },
+      "total": {
+        "max_ms": 6598.7,
+        "min_ms": 3652.8,
+        "p50_ms": 5125.8,
+        "p95_ms": 6451.4
+      }
+    }
+  },
+  "python": "3.11.15",
+  "rss_growth_mb": 2160.5,
+  "runs_per_profile": 2,
+  "schema": 2,
+  "streaming_promoted": false,
+  "stt_model": "distil-large-v3",
+  "stt_quant": null
+}

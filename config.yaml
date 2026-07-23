@@ -1,41 +1,45 @@
 # whisperflow-local configuration. All runtime knobs live here.
 
 hotkey:
-  combo: "<ctrl>+<cmd>"          # Ctrl+Win — Wispr Flow's Windows default. Modifier
-                                  # pair with no built-in OS action: zero collision,
-                                  # no reserved-combo fight, no registry hacks.
+  combo: "<cmd>+<shift>+<space>"     # macOS-friendly toggle; avoids Cmd+Space Spotlight.
 
 audio:
-  sample_rate: 16000              # faster-whisper expects 16kHz mono
+  sample_rate: 16000               # Whisper expects 16 kHz mono
   channels: 1
   dtype: "float32"
-  max_seconds: 300               # auto-finish at 5 min (graceful stop+process,
-                                  # not a silent cutoff) — guards a forgotten session
+  max_seconds: 300                 # auto-finish at 5 min; guards a forgotten session
 
 stt:
-  model: "large-v3-turbo"        # faster-whisper model id (speed-first)
-  device: "cuda"                 # falls back to cpu if cuda check fails
-  compute_type: "float16"        # int8_float16 on tight VRAM
-  beam_size: 1                   # greedy = much faster for short dictation
-  batched: true                  # parallel-chunk inference (2-4x on GPU)
-  batch_size: 16
+  model: "distil-large-v3"         # speed-first local dictation model on MLX
+  quant: null                      # distil-large-v3 quantized path is currently incompatible
+  batch_size: 12
   # confidence gates — drop empty/hallucinated output (no paste)
   min_duration_s: 0.4
   min_rms: 0.005
-  max_no_speech_prob: 0.6
-  min_avg_logprob: -1.2
+
+performance:
+  profile: "instant"              # instant | quality
+  streaming_enabled: false        # promoted only after benchmark gate passes
+  streaming_gate_passed: false
 
 cleanup:
-  # NOTE: plan pinned qwen2.5:7b-instruct; switched to qwen3.5:4b — already
-  # installed locally, newer family, faster. One-line swap to change.
-  model: "granite4.1:3b"        # pure instruct (non-reasoning) — no /no_think hack needed
-  keep_alive: "30m"              # keep the model warm between dictations
-  max_expansion_ratio: 2.5       # reject output longer than input * ratio (anti-injection)
+  # Preferred runtime is Unsloth Studio's persistent OpenAI-compatible server.
+  # If it is not running, cleanup falls back to direct Unsloth CLI inference.
+  provider: "openai-compatible"   # openai-compatible | unsloth-cli | omlx | ollama
+  fallback_provider: "unsloth-cli"
+  base_url: "http://localhost:8888/v1"
+  api_key_env: "UNSLOTH_API_KEY"
+  api_key: ""                     # do not commit sk-unsloth-* keys
+  api_key_keychain_account: "cleanup-api-key"
+  model: "default"                # Unsloth Studio serves the loaded model as default
+  model_path: "/Users/shawnvanbrunt/.cache/huggingface/hub/models--unsloth--Qwen3.5-4B-MTP-GGUF/snapshots/86835bf9949e4d14d6860f7910b1340ad4f271a9/Qwen3.5-4B-UD-Q4_K_XL.gguf"
+  server_model: "unsloth/Qwen3.5-4B-MTP-GGUF"
+  server_gguf_variant: "UD-Q4_K_XL"
+  keep_alive: "30m"               # Ollama-only; ignored by Unsloth/OpenAI-compatible
+  max_expansion_ratio: 2.5         # reject output longer than input * ratio (anti-injection)
   options:
     temperature: 0.2
-    num_predict: 2048             # output token cap — sized for a ~5 min dictation
-                                  # so long transcripts aren't truncated mid-text
-    # think: false               # set per-model if supported; doctor warns otherwise
+    num_predict: 2048              # output token cap sized for longer dictations
   prompt: |
     You are a transcript cleanup tool. Clean the user's raw dictated text into
     clear, polished, well-structured text: remove filler words (um, uh, like, you
@@ -48,22 +52,35 @@ cleanup:
     text, nothing else.
 
 insert:
-  mode: "paste"                  # paste | type
-  settle_delay_s: 0.15           # wait before restoring clipboard after Ctrl+V
-  press_enter_after: false       # do NOT auto-submit; user reviews then sends
+  mode: "paste"                   # paste | type
+  settle_delay_s: 0.15             # wait before restoring clipboard after Cmd+V
+  press_enter_after: false         # do NOT auto-submit; user reviews then sends
 
 overlay:
   enabled: true
 
 sound:
-  enabled: true                  # soft sine cue when recording starts/stops
-  start_freq: 587                # Hz (D5 — gentle)
-  stop_freq: 440                 # Hz (A4 — lower, softer)
-  error_freq: 196                # Hz (G3 — low double-buzz on failure)
-  cancel_freq: 311               # Hz (Eb4 — short descending blip on cancel)
+  enabled: true                    # soft sine cue when recording starts/stops
+  start_freq: 587
+  stop_freq: 440
+  error_freq: 196
+  cancel_freq: 311
   duration_ms: 120
-  volume: 0.05                   # quiet; raise toward 0.15 if too soft
+  volume: 0.05
 
 logging:
-  metadata_only: true            # never log transcript text unless false
+  metadata_only: true              # never log transcript text unless false
   log_transcripts: false
+
+personalization:
+  writing_mode: "natural"         # natural | polished | verbatim | email
+  per_app_modes: {}
+  vocabulary: []
+  replacements: []
+
+history:
+  enabled: false                  # transcript persistence is opt-in
+  retention_days: 7
+
+privacy:
+  recovery_ttl_seconds: 900       # memory-only recovery unless history is enabled

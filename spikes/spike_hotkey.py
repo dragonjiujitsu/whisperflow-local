@@ -2,7 +2,7 @@
 and drives the state machine.
 
 Acceptance:
-  A. Registering ``<ctrl>+<alt>+<space>`` succeeds.
+  A. Registering ``<cmd>+<shift>+<space>`` succeeds.
   B. Two synthetic activations fire the callback twice.
   C. The toggle walks IDLE -> RECORDING -> IDLE.
 
@@ -29,7 +29,7 @@ from pynput.keyboard import Controller, Key  # noqa: E402
 
 from whisperflow_local.hotkey import HotkeyListener  # noqa: E402
 
-COMBO = "<ctrl>+<alt>+<space>"
+COMBO = "<cmd>+<shift>+<space>"
 
 
 def main() -> int:
@@ -56,13 +56,13 @@ def main() -> int:
     kb = Controller()
 
     def press_combo() -> None:
-        kb.press(Key.ctrl)
-        kb.press(Key.alt)
+        kb.press(Key.cmd)
+        kb.press(Key.shift)
         kb.press(Key.space)
         time.sleep(0.05)
         kb.release(Key.space)
-        kb.release(Key.alt)
-        kb.release(Key.ctrl)
+        kb.release(Key.shift)
+        kb.release(Key.cmd)
 
     def driver() -> None:
         time.sleep(0.6)  # let the listener thread settle

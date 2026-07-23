@@ -4,7 +4,10 @@ __pycache__/
 .uv/
 dist/
 build/
+.build/
 *.egg-info/
 logs/
 *.log
 models/
+mlx_models/
+.cache/

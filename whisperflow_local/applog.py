@@ -5,19 +5,17 @@ from __future__ import annotations
 
 import logging
 from logging.handlers import RotatingFileHandler
-from pathlib import Path
-
-_LOG_DIR = Path(__file__).resolve().parents[1] / "logs"
+from .paths import AppPaths
 
 
 def get_logger(metadata_only: bool = True) -> logging.Logger:
-    _LOG_DIR.mkdir(exist_ok=True)
+    log_dir = AppPaths.discover().ensure().logs
     logger = logging.getLogger("whisperflow_local")
     if logger.handlers:
         return logger
     logger.setLevel(logging.INFO)
     handler = RotatingFileHandler(
-        _LOG_DIR / "app.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+        log_dir / "app.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8"
     )
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logger.addHandler(handler)
